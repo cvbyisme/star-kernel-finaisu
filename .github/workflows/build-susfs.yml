@@ -1,0 +1,404 @@
+name: Build star kernel with FinaSU (SUSFS on, preflight v2)
+
+on:
+  workflow_dispatch:
+    inputs:
+      ksu_ref:
+        description: 'FinaSU git ref'
+        required: false
+        default: 'v1.5.0'
+      kernel_repo:
+        description: 'kernel source repo (owner/name)'
+        required: false
+        default: 'cvbyisme/android_kernel_xiaomi_sm8350_miyume'
+      kernel_ref:
+        description: 'kernel source ref'
+        required: false
+        default: 'main'
+      disable_preinit:
+        description: 'Diagnostic: disable KSU preinit (bisect boot loop)'
+        required: false
+        default: false
+        type: boolean
+      disable_susfs:
+        description: 'Diagnostic: disable SUSFS entirely (bisect boot loop)'
+        required: false
+        default: false
+        type: boolean
+      embed_ksud:
+        description: 'Embed ksud into AnyKernel3 (default false: 包内不再内嵌 ksud，管理器单独安装)'
+        required: false
+        default: false
+        type: boolean
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    permissions:
+      contents: write
+      actions: read
+    steps:
+      - name: Checkout this CI repo
+        uses: actions/checkout@v4
+        with:
+          path: ci
+
+      - name: Checkout kernel sources
+        run: |
+          git clone --depth 1 --branch "${{ inputs.kernel_ref || 'main' }}" \
+            "https://github.com/${{ inputs.kernel_repo || 'cvbyisme/android_kernel_xiaomi_sm8350_miyume' }}.git" kernel
+          echo "kernel HEAD: $(git -C kernel rev-parse --short HEAD)"
+
+      # 功耗调优：内核调度源码补丁（input boost 默认关、io-is-busy 默认关、
+      # schedutil 强制 PELT 信号路径——WALT 信号路径在本机会卡小米 logo）。
+      - name: Scheduler power patches (input-boost off, io-is-busy off, schedutil PELT)
+        run: |
+          bash ci/scripts/sched-tune.sh "$PWD/kernel"
+
+      - name: Clone FinaSU into KernelSU/
+        run: |
+          rm -rf kernel/KernelSU
+          git clone --depth 1 --branch "${{ inputs.ksu_ref || 'master' }}" \
+            https://github.com/LyraVoid/FinaSU.git kernel/KernelSU
+          echo "FinaSU HEAD: $(git -C kernel/KernelSU rev-parse --short HEAD)"
+
+      - name: Integrate SUSFS 5.4 into FinaSU kernel tree
+        run: |
+          chmod +x ci/scripts/susfs-setup.sh
+          # susfs-setup 的锚点落后于 FinaSU master（如 kernel_umount.c 已改 2 参
+          # 数签名），允许它部分失败；preflight 会补齐缺口并在验证阶段兜底。
+          KDIR_OVERRIDE="$PWD/kernel" bash ci/scripts/susfs-setup.sh \
+            || echo "::warning::susfs-setup partially applied; preflight compensates"
+
+      # FinaSU v1.4.2 管理器的 ksud 要求内核 SUSFS 版本字符串精确等于 v2.3.0，
+      # 否则判定 unknown_protocol（SUSFS 页只读、全功能不可用）。内核树是
+      # v2.1.0，但 wire 协议（CMD 编号 + st_susfs 结构）与 v2.3.0 完全兼容，
+      # 故让内核如实汇报 v2.3.0，并顺手修 ctime 伪装标志的笔误。
+      - name: Point kernel SUSFS at v2.3.0 wire protocol (FinaSU manager)
+        run: |
+          chmod +x ci/scripts/susfs-version.sh
+          bash ci/scripts/susfs-version.sh "$PWD/kernel"
+
+      - name: Preflight (5.4 shim headers, Kbuild injection, devpts, umount)
+        run: |
+          chmod +x ci/scripts/preflight.sh
+          DISABLE_PREINIT="${{ inputs.disable_preinit || 'false' }}" \
+          DISABLE_SUSFS="${{ inputs.disable_susfs || 'false' }}" \
+            bash ci/scripts/preflight.sh "$PWD/kernel"
+
+      # ksud 不在时把 su 变成 /system/bin/sh（SukiSU 同款拦不住 root）。
+      - name: Fallback su -> /system/bin/sh when ksud missing
+        run: |
+          chmod +x ci/scripts/ksu-su-fallback.sh
+          bash ci/scripts/ksu-su-fallback.sh "$PWD/kernel"
+
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+            /usr/local/share/boost "$AGENT_TOOLSDIRECTORY" || true
+          df -h /
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq build-essential flex bison libssl-dev \
+            libelf-dev bc zip unzip python3 cpio rsync device-tree-compiler \
+            git curl wget xz-utils liblz4-dev zlib1g-dev libncurses-dev \
+            linux-libc-dev || true
+          sudo ldconfig || true
+          echo "=== libxml2 check ==="
+          ldconfig -p | grep libxml2 || echo "libxml2.so missing"
+          if ! ldconfig -p | grep -q "libxml2.so.2"; then
+            for pkg in libxml2-dev libxml2-2 libxml2-16 libxml2t64; do
+              sudo apt-get install -y -qq "$pkg" 2>/dev/null && echo "ok $pkg" || true
+            done
+            sudo ldconfig || true
+          fi
+          if ! ldconfig -p | grep -q "libxml2.so.2"; then
+            LIB=$(find /usr/lib /lib -name "libxml2.so*" 2>/dev/null | head -1)
+            echo "fallback lib: $LIB"
+            if [ -n "$LIB" ]; then
+              T=$(readlink -f "$LIB")
+              sudo ln -sf "$T" /usr/lib/x86_64-linux-gnu/libxml2.so.2 || true
+              sudo ldconfig || true
+            else
+              echo "::error::libxml2.so.2 unavailable"
+              exit 1
+            fi
+          fi
+          ldconfig -p | grep libxml2 || true
+
+      - name: Download Clang (ZyCromerZ mirror)
+        run: |
+          mkdir -p $HOME/toolchain
+          cd $HOME/toolchain
+          curl -sSL --retry 5 --retry-delay 5 -o clang.tar.gz \
+            https://github.com/ZyCromerZ/Clang/releases/download/14.0.6-20261022-release/Clang-14.0.6-20261022.tar.gz
+          tar -xzf clang.tar.gz
+          rm -f clang.tar.gz
+          CLANG_BIN=$(find "$HOME/toolchain" -maxdepth 4 -name clang \( -type f -o -type l \) | head -1)
+          if [ -z "$CLANG_BIN" ]; then
+            echo "::error::clang binary not found in toolchain tarball"
+            find "$HOME/toolchain" -maxdepth 3 | head -30
+            exit 1
+          fi
+          TCDIR=$(dirname "$CLANG_BIN")
+          echo "Toolchain bin: $TCDIR"
+          echo "TCBIN=$TCDIR" >> $GITHUB_ENV
+          "$TCDIR/clang" --version
+
+      # 变体二分用缓存：同一 (disable_preinit, disable_susfs) 组合复用编译缓存，
+      # 后续变体构建可从 ~28 分钟压到 ~10 分钟（只重编 KSU + 链接）。
+      - name: ccache
+        uses: hendrikmuhs/ccache-action@v1.2
+        with:
+          key: star-${{ inputs.disable_preinit }}-${{ inputs.disable_susfs }}
+          max-size: 2G
+
+      # 快速语法门：只编 KSU 子系统，~3-5 分钟暴露编译错误，全量构建前的闸门。
+      - name: Fast compile gate (KSU objects only)
+        run: |
+          cd kernel
+          export PATH="/usr/lib/ccache:$TCBIN:$PATH"
+          export ARCH=arm64 SUBARCH=arm64 LLVM=1 LLVM_IAS=1
+          export CC=clang LD=ld.lld AR=llvm-ar NM=llvm-nm
+          export OBJCOPY=llvm-objcopy OBJDUMP=llvm-objdump STRIP=llvm-strip READELF=llvm-readelf
+
+          make -j$(nproc) O=out star_defconfig
+          if [ "${{ inputs.disable_susfs || 'false' }}" = "true" ]; then
+            ./scripts/config --file out/.config \
+              --enable KPROBES --enable KSU --enable KSU_DYNAMIC_MANAGER \
+              --disable KSU_SUSFS --disable KSU_SUSFS_SUS_PATH \
+              --disable KSU_SUSFS_SUS_MOUNT --disable KSU_SUSFS_SUS_KSTAT \
+              --disable KSU_SUSFS_SPOOF_UNAME --disable KSU_SUSFS_ENABLE_LOG \
+              --disable KSU_SUSFS_HIDE_KSU_SUSFS_SYMBOLS \
+              --disable KSU_SUSFS_SPOOF_CMDLINE_OR_BOOTCONFIG \
+              --disable KSU_SUSFS_OPEN_REDIRECT --disable KSU_SUSFS_SUS_MAP
+          else
+            ./scripts/config --file out/.config \
+              --enable KPROBES --enable KSU --enable KSU_SUSFS \
+              --enable KSU_SUSFS_SUS_PATH --enable KSU_SUSFS_SUS_MOUNT \
+              --enable KSU_SUSFS_SUS_KSTAT --enable KSU_SUSFS_SPOOF_UNAME \
+              --enable KSU_SUSFS_ENABLE_LOG --enable KSU_SUSFS_HIDE_KSU_SUSFS_SYMBOLS \
+              --enable KSU_SUSFS_SPOOF_CMDLINE_OR_BOOTCONFIG \
+              --enable KSU_SUSFS_OPEN_REDIRECT --enable KSU_SUSFS_SUS_MAP \
+              --enable KSU_DYNAMIC_MANAGER
+          fi
+          # ---- 功耗调优：默认 governor = schedutil ----
+          bash ../ci/scripts/power-tune.sh "$PWD"
+          make -j$(nproc) O=out olddefconfig
+          bash ../ci/scripts/power-tune.sh "$PWD" verify
+          bash ../ci/scripts/sched-tune.sh "$PWD" verify
+
+          # flask.h 是 security/selinux 目录构建时才生成的（out/security/selinux/flask.h），
+          # 但 kernelsu 的 objsec.h 会 include 它；先单独生成，避免竞态。
+          make -j$(nproc) O=out security/selinux/flask.h \
+            || make -j$(nproc) O=out security/selinux/
+
+          echo "=== gate: building KSU objects ==="
+          make -j$(nproc) O=out drivers/kernelsu/kernelsu.o \
+            || make -j$(nproc) O=out drivers/kernelsu/
+          echo "=== gate: PASS ==="
+
+      - name: Build kernel
+        run: |
+          cd kernel
+          export PATH="/usr/lib/ccache:$TCBIN:$PATH"
+          export ARCH=arm64 SUBARCH=arm64 LLVM=1 LLVM_IAS=1
+          export CC=clang LD=ld.lld AR=llvm-ar NM=llvm-nm
+          export OBJCOPY=llvm-objcopy OBJDUMP=llvm-objdump STRIP=llvm-strip READELF=llvm-readelf
+          clang --version
+
+          # 内核版本后缀：5.4.302-Neko-CL-<日期>-<随机>
+          NEKO_VER="Neko-CL-$(date +%Y%m%d)-$(od -An -N2 -tu2 /dev/urandom | tr -d ' ')"
+          echo "NEKO_VER=$NEKO_VER" >> $GITHUB_ENV
+          echo "kernel localversion: -$NEKO_VER"
+
+          make -j$(nproc) O=out star_defconfig
+
+          if [ "${{ inputs.disable_susfs || 'false' }}" = "true" ]; then
+            ./scripts/config --file out/.config \
+              --enable KPROBES --enable KSU --enable KSU_DYNAMIC_MANAGER \
+              --disable KSU_SUSFS --disable KSU_SUSFS_SUS_PATH \
+              --disable KSU_SUSFS_SUS_MOUNT --disable KSU_SUSFS_SUS_KSTAT \
+              --disable KSU_SUSFS_SPOOF_UNAME --disable KSU_SUSFS_ENABLE_LOG \
+              --disable KSU_SUSFS_HIDE_KSU_SUSFS_SYMBOLS \
+              --disable KSU_SUSFS_SPOOF_CMDLINE_OR_BOOTCONFIG \
+              --disable KSU_SUSFS_OPEN_REDIRECT --disable KSU_SUSFS_SUS_MAP
+          else
+            ./scripts/config --file out/.config \
+              --enable KPROBES --enable KSU --enable KSU_SUSFS \
+              --enable KSU_SUSFS_SUS_PATH --enable KSU_SUSFS_SUS_MOUNT \
+              --enable KSU_SUSFS_SUS_KSTAT --enable KSU_SUSFS_SPOOF_UNAME \
+              --enable KSU_SUSFS_ENABLE_LOG --enable KSU_SUSFS_HIDE_KSU_SUSFS_SYMBOLS \
+              --enable KSU_SUSFS_SPOOF_CMDLINE_OR_BOOTCONFIG \
+              --enable KSU_SUSFS_OPEN_REDIRECT --enable KSU_SUSFS_SUS_MAP \
+              --enable KSU_DYNAMIC_MANAGER
+          fi
+
+          # 不要 -g<sha> 后缀，只用我们自己的 Neko-CL 版本号
+          ./scripts/config --file out/.config --set-str LOCALVERSION ""
+          ./scripts/config --file out/.config --disable LOCALVERSION_AUTO
+
+          # ---- 功耗调优：默认 governor = schedutil ----
+          bash ../ci/scripts/power-tune.sh "$PWD"
+          make -j$(nproc) O=out olddefconfig
+          bash ../ci/scripts/power-tune.sh "$PWD" verify
+
+          # 与门禁同理：先确保 flask.h 已生成，避免与 selinux 目录构建竞态
+          make -j$(nproc) O=out security/selinux/flask.h \
+            || make -j$(nproc) O=out security/selinux/
+
+          echo "=== SUSFS / KSU config check ==="
+          grep -E 'CONFIG_KSU|CONFIG_SUSFS|CONFIG_KPROBES|CONFIG_THREAD_INFO' out/.config || true
+
+          MISSING=0
+          SYMS="CONFIG_KSU CONFIG_KPROBES"
+          if [ "${{ inputs.disable_susfs || 'false' }}" != "true" ]; then
+            SYMS="$SYMS CONFIG_KSU_SUSFS CONFIG_KSU_SUSFS_SUS_PATH \
+                  CONFIG_KSU_SUSFS_SUS_MOUNT CONFIG_KSU_SUSFS_SUS_MAP \
+                  CONFIG_KSU_SUSFS_OPEN_REDIRECT"
+          fi
+          for sym in $SYMS; do
+            if ! grep -qx "$sym=y" out/.config; then
+              echo "::error::$sym=y is missing from out/.config"
+              MISSING=1
+            fi
+          done
+          # ---- 功耗调优门禁 ----
+          bash ../ci/scripts/power-tune.sh "$PWD" verify || MISSING=1
+          bash ../ci/scripts/sched-tune.sh "$PWD" verify || MISSING=1
+          if [ "${{ inputs.disable_susfs || 'false' }}" = "true" ]; then
+            RESIDUE=$(grep -E 'CONFIG_KSU_SUSFS' out/.config | grep '=y' || true)
+            if [ -n "$RESIDUE" ]; then
+              echo "::error::SUSFS residue: $RESIDUE"
+              MISSING=1
+            else
+              echo "SUSFS disabled: clean"
+            fi
+          fi
+          if [ "$MISSING" -ne 0 ]; then
+            echo "--- dependency diagnostics ---"
+            grep -E '^CONFIG_(KPROBES|EXT4_FS|THREAD_INFO_IN_TASK|MODULES)' out/.config || true
+            exit 1
+          fi
+          echo "KSU/SUSFS config gate: PASS"
+
+          # D1 修补：不传 KSU_SECOND_SIGNATURE_RELEASE=1 时，
+          # FINASU_TRUSTED_* 回落到 slot1（KSU 官方签名），slot2 白注入。
+          make -j$(nproc) O=out LOCALVERSION="-$NEKO_VER" \
+            KSU_SECOND_SIGNATURE_RELEASE=1 \
+            KSU_EXPECTED_SIZE2=716 \
+            KSU_EXPECTED_HASH2=2d89b50aaf1db013c2b6738f973f48b62ea21a3a8d7216bfec3521065d448458 \
+            Image Image.gz dtbs
+
+      - name: Collect artifacts
+        run: |
+          mkdir -p artifact
+          cp kernel/out/arch/arm64/boot/Image artifact/Image
+          cp kernel/out/arch/arm64/boot/Image.gz artifact/Image.gz || true
+          cp kernel/out/.config artifact/kernel.config
+          (cd artifact && sha256sum Image > Image.sha256)
+          strings artifact/Image | grep -m3 'Linux version' || true
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: star-finaus-kernel
+          path: artifact/*
+          if-no-files-found: error
+      - name: Package AnyKernel3 zip
+        run: |
+          set -e
+          git clone --depth 1 https://github.com/osm0sis/AnyKernel3.git ak3
+          cd ak3
+          rm -rf .git .github patch README.md
+          mkdir -p patch
+          cp ../kernel/out/arch/arm64/boot/Image .
+          # ---- 可选：内置 ksud（embed_ksud=false 用于验证内核侧 su fallback）----
+          # 注意：boolean 输入在表达式里用 || 处理会把 false 当成 falsy 而回落到 true，因此这里直接引用字串。
+          EMBED_KSUD="${{ inputs.embed_ksud }}"
+          EMBED_KSUD="${EMBED_KSUD:-false}"
+          echo "EMBED_KSUD=$EMBED_KSUD"
+          echo "KSUD_EMBED=$EMBED_KSUD" >> $GITHUB_ENV
+          if [ "$EMBED_KSUD" = "true" ]; then
+            KSAPK_URL="https://github.com/LyraVoid/FinaSU/releases/download/v1.5.0/FinaSU_v1.5.0_33174-release.apk"
+            if curl -fL --retry 3 --connect-timeout 20 -o /tmp/fina.apk "$KSAPK_URL"; then
+              if unzip -o -j /tmp/fina.apk "lib/arm64-v8a/libksud.so" -d /tmp/kx > /dev/null; then
+                cp /tmp/kx/libksud.so ./ksud
+                chmod 755 ./ksud
+                echo "ksud injected: $(stat -c %s ./ksud) bytes"
+              else
+                echo "::warning::libksud.so not found in APK"
+              fi
+            else
+              echo "::warning::APK download failed, AK3 will NOT contain ksud"
+            fi
+            cat ../ci/scripts/ak3-ksud.sh >> anykernel.sh
+          else
+            echo "::notice::ksud NOT embedded - kernel-side su fallback test build"
+          fi
+          
+          # ---- TWRP 显示：内核详细信息 + 共创者 ----
+          BUILD_STAMP=$(date -u +%Y%m%d-%H%MZ)
+          CLANG_STR=$(clang --version | head -1 | cut -c1-48)
+          if [ "${{ inputs.disable_susfs || 'false' }}" = "true" ]; then SUSFS_STATE=disabled; else SUSFS_STATE=enabled; fi
+          if [ "$EMBED_KSUD" = "true" ]; then KSUD_STATE=embedded; else KSUD_STATE=not_embedded; fi
+          # 不加引号的 heredoc：让 $NEKO_VER / $BUILD_STAMP 等在 CI 侧就展开
+          cat >> anykernel.sh <<AK3EOF
+          
+          ui_print " ";
+          ui_print "  star (Xiaomi 11 Ultra) FinaSU kernel";
+          ui_print "  kernel : 5.4.302-$NEKO_VER";
+          ui_print "  build  : $BUILD_STAMP UTC";
+          ui_print "  clang  : $CLANG_STR";
+          ui_print "  root   : FinaSU / KernelSU, signature slot2";
+          ui_print "  susfs  : $SUSFS_STATE";
+          ui_print "  ksud   : $KSUD_STATE";
+          ui_print "  author : cvbyisme & LuNanzhi";
+          ui_print " ";
+          AK3EOF
+          
+
+          sed -i "s/^kernel.string=.*/kernel.string=star-FinaSU 5.4.302-$NEKO_VER by cvby/" anykernel.sh
+          sed -i "s/^device.name1=.*/device.name1=star/" anykernel.sh
+          sed -i "s/^device.name2=.*/device.name2=/" anykernel.sh
+          sed -i "s/^device.name3=.*/device.name3=/" anykernel.sh
+          sed -i "s/^device.name4=.*/device.name4=/" anykernel.sh
+          sed -i "s/^device.name5=.*/device.name5=/" anykernel.sh
+          sed -i "s#^BLOCK=.*#BLOCK=/dev/block/bootdevice/by-name/boot;#" anykernel.sh
+          sed -i "s/^IS_SLOT_DEVICE=.*/IS_SLOT_DEVICE=1;/" anykernel.sh
+          sed -i '/^backup_file /d;/^replace_string /d;/^insert_line /d;/^append_file /d;/^patch_fstab /d' anykernel.sh
+          chmod +x anykernel.sh
+          NAME="star-FinaSU-$(date +%Y%m%d)-run${GITHUB_RUN_NUMBER}"
+          zip -r9 "../${NAME}.zip" . -x "*.git*" > /dev/null
+          cd ..
+          ls -lh *.zip
+          echo "AK3_NAME=${NAME}" >> $GITHUB_ENV
+
+      - name: Publish test release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: star-test-${{ github.run_number }}
+          name: star FinaSU kernel test build
+          body: |
+            star (Xiaomi 11 Ultra) FinaSU built-in - TEST BUILD
+
+            NOT VERIFIED ON DEVICE. Flash at your own risk.
+
+            - Kernel 5.4.302-${{ env.NEKO_VER }}, ZyC clang 14.0.6
+            - KSU_SECOND_SIGNATURE_RELEASE=1 (slot2 = FinaSU release key, size 716)
+            - preflight v2: 5.4 shim headers + global -include + devpts/umount retarget
+            - Package: AnyKernel3 zip
+            - ksud embedded: ${{ env.KSUD_EMBED || 'false' }}
+
+            Install: flash in TWRP or a kernel flasher app.
+            Manager: FinaSU manager matching the slot2 signature.
+            Rollback: keep a stock boot.img backup.
+          files: ${{ github.workspace }}/${{ env.AK3_NAME }}.zip
+          prerelease: true
+          draft: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+

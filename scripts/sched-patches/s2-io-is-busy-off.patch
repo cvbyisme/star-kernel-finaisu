@@ -1,0 +1,15 @@
+diff --git a/kernel/sched/walt/walt.c b/kernel/sched/walt/walt.c
+index cfe9a53ac..b7047a01e 100644
+--- a/kernel/sched/walt/walt.c
++++ b/kernel/sched/walt/walt.c
+@@ -124,7 +124,9 @@ static cpumask_t asym_freq_match_cpus = CPU_MASK_NONE;
+ 
+ __read_mostly unsigned int sched_ravg_hist_size = 5;
+ 
+-static __read_mostly unsigned int sched_io_is_busy = 1;
++/* Power refactor: iowait no longer inflates WALT busy-time demand (0),
++ * so IO-bound workloads stop pushing up frequency. */
++static __read_mostly unsigned int sched_io_is_busy = 0;
+ 
+ __read_mostly unsigned int sysctl_sched_window_stats_policy =
+ 	WINDOW_STATS_MAX_RECENT_AVG;

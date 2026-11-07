@@ -1,0 +1,985 @@
+#!/bin/bash
+set -euo pipefail
+KDIR="${KDIR_OVERRIDE:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)}"
+cd "$KDIR"
+echo "KERNEL_DIR=$KDIR"
+echo "=== [SUSFS] sanity: kernel tree already ships SUSFS 5.4 ==="
+for f in fs/susfs.c include/linux/susfs.h include/linux/susfs_def.h; do
+  [ -f "$f" ] || { echo "::error::missing $f"; exit 1; }
+  echo "OK $f ($(wc -c < "$f") bytes)"
+done
+grep -n TIF_PROC_UMOUNTED include/linux/susfs_def.h | head -3
+grep -n susfs.o fs/Makefile | head -3
+
+echo "=== [SUSFS] step 1: FinaSU <-> kernel API name aliases ==="
+if grep -q susfs_set_current_proc_umounted_for_zygote_next include/linux/susfs_def.h; then
+  echo "aliases already present, skipping"
+else
+python3 - <<'PYEOF'
+path = 'include/linux/susfs_def.h'
+s = open(path).read()
+BLK = '''/* ===== FinaSU compat: no_su / zygote_next aliases =====
+ * FinaSU calls the newer helper names; this 5.4 tree implements the same
+ * TIF_PROC_UMOUNTED mechanism under the umounted name. Semantically
+ * identical, so map one onto the other instead of editing fs/susfs.c.
+ * The zygote_next variants have no separate flag on 5.4, so they collapse
+ * onto the same TIF bit.
+ */
+#ifndef susfs_set_current_proc_no_su
+#define susfs_set_current_proc_no_su() susfs_set_current_proc_umounted()
+#endif
+#ifndef susfs_is_current_proc_no_su
+#define susfs_is_current_proc_no_su() susfs_is_current_proc_umounted()
+#endif
+#ifndef susfs_set_current_proc_umounted_for_zygote_next
+#define susfs_set_current_proc_umounted_for_zygote_next() susfs_set_current_proc_umounted()
+#endif
+#ifndef susfs_is_current_proc_umounted_for_zygote_next
+#define susfs_is_current_proc_umounted_for_zygote_next() susfs_is_current_proc_umounted()
+#endif
+
+'''
+anchor = '#endif // #ifndef KSU_SUSFS_DEF_H'
+assert s.count(anchor) == 1, 'guard anchor not unique'
+s = s.replace(anchor, BLK + anchor, 1)
+open(path, 'w').write(s)
+print('susfs_def.h aliases appended, bytes=%d' % len(s))
+PYEOF
+  echo "aliases appended"
+fi
+
+echo "=== [SUSFS] step 2: linux 5.4 uaccess / pgtable shims ==="
+cat > include/linux/ksu54_compat.h <<'C54'
+#ifndef _KSU54_COMPAT_H
+#define _KSU54_COMPAT_H
+#include <linux/version.h>
+#include <linux/types.h>
+#include <linux/sched.h>
+#include <linux/uaccess.h>
+#include <linux/mm.h>
+#include <linux/highmem.h>
+#include <linux/errno.h>
+#include <linux/string.h>
+/* This vendor 5.4 tree still ships <linux/task_work.h> and
+ * <linux/static_key.h>, but <linux/minmax.h> (5.10+) and <linux/hex.h>
+ * (6.2+) are absent, so their macros are re-supplied here.
+ */
+#include <linux/task_work.h>
+#include <linux/jump_label.h>
+#include <linux/kernel.h>
+/* <linux/pgtable.h> only exists since Linux 5.8 */
+#if LINUX_VERSION_CODE < KERNEL_VERSION(5, 8, 0)
+#include <asm/pgtable.h>
+#endif
+/* untagged_addr() is Linux 5.7+; arm64 5.4 does no tagging on these paths */
+#ifndef untagged_addr
+#define untagged_addr(addr) (addr)
+#endif
+/* *_from_user_nofault / *_to_user_nofault are Linux 5.8+ */
+#if LINUX_VERSION_CODE < KERNEL_VERSION(5, 8, 0)
+static inline int ksu54_strncpy_from_user_nofault(char *dst,
+  const void __user *src,
+  long count)
+{
+long ret;
+if (count < 0)
+return -EINVAL;
+if (!access_ok(src, count))
+return -EFAULT;
+pagefault_disable();
+ret = strncpy_from_user(dst, src, count);
+pagefault_enable();
+if (ret < 0)
+return ret;
+if (ret >= count) {
+dst[count - 1] = 0;
+return -ERANGE;
+}
+return ret;
+}
+#define strncpy_from_user_nofault(dst, src, n) \
+ksu54_strncpy_from_user_nofault((char *)(dst), (const void __user *)(src), (long)(n))
+static inline long ksu54_copy_from_user_nofault(void *dst,
+const void __user *src,
+size_t size)
+{
+long ret;
+if (!access_ok(src, size))
+return -EFAULT;
+pagefault_disable();
+ret = __copy_from_user_inatomic(dst, src, size);
+pagefault_enable();
+return ret ? -EFAULT : 0;
+}
+#define copy_from_user_nofault(dst, src, n) \
+ksu54_copy_from_user_nofault((void *)(dst), (const void __user *)(src), (size_t)(n))
+static inline long ksu54_copy_to_user_nofault(void __user *dst,
+      const void *src,
+      size_t size)
+{
+long ret;
+if (!access_ok(dst, size))
+return -EFAULT;
+pagefault_disable();
+ret = __copy_to_user_inatomic(dst, src, size);
+pagefault_enable();
+return ret ? -EFAULT : 0;
+}
+#define copy_to_user_nofault(dst, src, n) \
+ksu54_copy_to_user_nofault((void __user *)(dst), (const void *)(src), (size_t)(n))
+#endif /* < 5.8 */
+/* __p4d_to_phys(): p4d is folded away below Linux 5.8 (5-level fixup) */
+#ifndef __p4d_to_phys
+#define __p4d_to_phys(p4d) __pgd_to_phys(p4d)
+#endif
+/* copy_to_kernel_nofault() appeared in Linux 5.8 */
+#if LINUX_VERSION_CODE < KERNEL_VERSION(5, 8, 0)
+static inline int ksu54_copy_to_kernel_nofault(void *dst, const void *src,
+					       size_t size)
+{
+	return copy_from_kernel_nofault(dst, src, size);
+}
+#define copy_to_kernel_nofault(dst, src, n) \
+	ksu54_copy_to_kernel_nofault((void *)(dst), (const void *)(src), (size_t)(n))
+#endif /* < 5.8 */
+
+/* <linux/minmax.h> was split out of <linux/kernel.h> only in Linux 5.10 */
+#if LINUX_VERSION_CODE < KERNEL_VERSION(5, 10, 0)
+#ifndef min_t
+#define min_t(type, x, y) ({ type __min1 = (x); type __min2 = (y); __min1 < __min2 ? __min1 : __min2; })
+#endif
+#ifndef max_t
+#define max_t(type, x, y) ({ type __max1 = (x); type __max2 = (y); __max1 > __max2 ? __max1 : __max2; })
+#endif
+#ifndef min
+#define min(x, y) ({ __typeof__(x) __m1 = (x); __typeof__(y) __m2 = (y); __m1 < __m2 ? __m1 : __m2; })
+#endif
+#ifndef max
+#define max(x, y) ({ __typeof__(x) __M1 = (x); __typeof__(y) __M2 = (y); __M1 > __M2 ? __M1 : __M2; })
+#endif
+#ifndef clamp
+#define clamp(v, lo, hi) ({ __typeof__(v) __c = (v); __typeof__(lo) __l = (lo); __typeof__(hi) __h = (hi); __c < __l ? __l : (__c > __h ? __h : __c); })
+#endif
+#endif /* < 5.10 */
+#endif /* _KSU54_COMPAT_H */
+C54
+echo "written include/linux/ksu54_compat.h"
+echo "=== [SUSFS] step 3: drop the zygote_next call FinaSU cannot satisfy on 5.4 ==="
+SH="$KDIR/KernelSU/kernel/hook/setuid_hook.c"
+if [ -f "$SH" ]; then
+python3 - <<'PYEOF2'
+p = 'KernelSU/kernel/hook/setuid_hook.c'
+s = open(p).read()
+old = 'static void ksu_susfs_mark_umounted(bool zygote_next)\n{\n    susfs_set_current_proc_no_su();\n    susfs_set_current_proc_umounted();\n    if (zygote_next)\n        susfs_set_current_proc_umounted_for_zygote_next();\n}'
+new = ('static void ksu_susfs_mark_umounted(bool zygote_next)\n'
+       '{\n'
+       '    /*\n'
+       '     * A 5.4 kernel side only exposes the single TIF_PROC_UMOUNTED flag,\n'
+       '     * so FinaSU no_su / zygote_next markers collapse onto that bit.\n'
+       '     */\n'
+       '    (void)zygote_next;\n'
+       '    susfs_set_current_proc_no_su();\n'
+       '    susfs_set_current_proc_umounted();\n'
+       '}')
+if s.count(old) == 1:
+    open(p, 'w').write(s.replace(old, new, 1))
+    print('setuid_hook.c patched')
+else:
+    print('setuid_hook.c: anchor count=%d, skipped' % s.count(old))
+PYEOF2
+fi
+
+SUDIR="$KDIR/KernelSU/kernel"
+[ -d "$SUDIR" ] || { echo "::error::FinaSU tree not found at $SUDIR"; exit 1; }
+F="$SUDIR/feature/sucompat.c"
+if [ -f "$F" ] && grep -q pgtable.h "$F"; then
+  sed -i "s|^#include <linux/pgtable.h>$|#include <linux/ksu54_compat.h>|" "$F"
+  echo "sucompat.c: pgtable -> ksu54_compat"
+fi
+for G in "$SUDIR/runtime/ksud_integration.c" \
+         "$SUDIR/sulog/event.c" \
+         "$SUDIR/feature/adb_root.c" \
+         "$SUDIR/hook/syscall_event_bridge.c" \
+         "$SUDIR/preinit/preinit.c" \
+         "$SUDIR/hook/arm64/patch_memory.c"; do
+  [ -f "$G" ] || continue
+  if ! grep -q ksu54_compat "$G"; then
+    sed -i "1i #include <linux/ksu54_compat.h>" "$G"
+    echo "injected: ${G#$KDIR/}"
+  fi
+done
+
+echo "=== [SUSFS] step 4a-hdr: strip <linux/minmax.h>/<linux/hex.h> (absent in 5.4) ==="
+for G in $(grep -rl "#include <linux/minmax.h>\|#include <linux/hex.h>" "$SUDIR" --include=*.c --include=*.h 2>/dev/null); do
+  sed -i "/^#include <linux\/minmax.h>$/d; /^#include <linux\/hex.h>$/d" "$G"
+  echo "hdr stripped: ${G#$KDIR/}"
+done
+echo "=== [SUSFS] step 4b: TWA_* enum is 5.10+, task_work_add takes bool on 5.4 ==="
+for T in "$SUDIR/manager/dynamic_manager.c" \
+         "$SUDIR/policy/allowlist.c" \
+         "$SUDIR/supercall/supercall.c"; do
+  [ -f "$T" ] || continue
+  if grep -q 'TWA_RESUME\|TWA_NONE\|TWA_SIGNAL' "$T"; then
+    sed -i 's/, TWA_RESUME)/, true)/g; s/, TWA_NONE)/, false)/g; s/, TWA_SIGNAL)/, true)/g' "$T"
+    echo "TWA_* -> bool: ${T#$KDIR/}"
+  fi
+done
+echo "=== [SUSFS] step 4c: seccomp.filter_count / seccomp_filter_release are 5.9+ ==="
+APF="$SUDIR/policy/app_profile.c"
+if [ -f "$APF" ] && grep -q 'filter_count' "$APF"; then
+  python3 - "$APF" <<'APFEOF'
+import io, sys
+p = sys.argv[1]
+lines = io.open(p, encoding='utf-8').read().split(chr(10))
+out = []
+for l in lines:
+    if 'seccomp.filter_count' in l:
+        out.append('#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 9, 0)')
+        out.append(l)
+        out.append('#endif')
+    elif l.strip() == 'seccomp_filter_release(fake);':
+        ind = l[:len(l) - len(l.lstrip())]
+        out.append('#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 9, 0)')
+        out.append(l)
+        out.append('#else')
+        out.append(ind + 'put_seccomp_filter(fake);')
+        out.append('#endif')
+    else:
+        out.append(l)
+io.open(p, 'w', encoding='utf-8').write(chr(10).join(out))
+print('app_profile.c seccomp 5.4 guards added')
+APFEOF
+fi
+echo "=== [SUSFS] step 4d: struct selinux_policy is 5.7+, backport to ss->policydb ==="
+SPH="$SUDIR/selinux/sepolicy.h"
+RUL="$SUDIR/selinux/rules.c"
+SEC="$SUDIR/selinux/sepolicy.c"
+if [ -f "$SPH" ] && ! grep -q KSU54_SELINUX_POLICY_SHIM "$SPH"; then
+  python3 - "$SPH" "$RUL" <<'SEL54EOF'
+import io, sys
+
+h = sys.argv[1]
+s = io.open(h, encoding='utf-8').read()
+shim = (
+    '#if LINUX_VERSION_CODE < KERNEL_VERSION(5, 7, 0)' + chr(10) +
+    '#define KSU54_SELINUX_POLICY_SHIM 1' + chr(10) +
+    '#' + 'include <linux/sched.h>' + chr(10) +
+    '#' + 'include "ss/services.h"' + chr(10) +
+    'struct selinux_policy {' + chr(10) +
+    '    struct policydb policydb;' + chr(10) +
+    '    /* FinaSU v1.5.0 tracks SELinux policy generations here (5.7+ field). */' + chr(10) +
+    '    u32 latest_granting;' + chr(10) +
+    '};' + chr(10) +
+    'extern struct selinux_state selinux_state;' + chr(10) +
+    '#' + 'endif' + chr(10))
+s = s.replace('struct selinux_policy *ksu_dup_sepolicy', shim + 'struct selinux_policy *ksu_dup_sepolicy', 1)
+io.open(h, 'w', encoding='utf-8').write(s)
+print('sepolicy.h: 5.4 struct selinux_policy shim')
+
+r = sys.argv[2]
+s = io.open(r, encoding='utf-8').read()
+if 'KSU54_POLICY_FIELD' not in s:
+    old = 'struct selinux_policy *backup_sepolicy;'
+    new = (
+        'struct selinux_policy *backup_sepolicy;' + chr(10) + chr(10) +
+        '#if LINUX_VERSION_CODE < KERNEL_VERSION(5, 7, 0)' + chr(10) +
+        '#define KSU54_POLICY_FIELD' + chr(10) +
+        'static u32 ksu54_policy_generation;' + chr(10) +
+        'static struct selinux_policy *ksu54_current_policy(void)' + chr(10) +
+        '{' + chr(10) +
+        '    static struct selinux_policy shadow;' + chr(10) +
+        '    shadow.policydb = selinux_state.ss->policydb;' + chr(10) +
+        '    shadow.latest_granting = ksu54_policy_generation;' + chr(10) +
+        '    return &shadow;' + chr(10) +
+        '}' + chr(10) +
+        '#define KSU_POLICY_GET() ksu54_current_policy()' + chr(10) +
+        # FinaSU v1.5.0 hands the policy generation around through
+        # selinux_policy->latest_granting. Keep the counter alive across
+        # generations even though 5.4 stores only the policydb.
+        '#define KSU_POLICY_SET(pol) do { \\' + chr(10) +
+        '    ksu54_policy_generation = (pol)->latest_granting; \\' + chr(10) +
+        '    selinux_state.ss->policydb = (pol)->policydb; \\' + chr(10) +
+        '} while (0)' + chr(10) +
+        '#define KSU_POLICY_LOCK() mutex_lock(&selinux_state.ss->status_lock)' + chr(10) +
+        '#define KSU_POLICY_UNLOCK() mutex_unlock(&selinux_state.ss->status_lock)' + chr(10) +
+        '#else' + chr(10) +
+        '#define KSU_POLICY_GET() rcu_dereference_protected(selinux_state.policy, lockdep_is_held(&selinux_state.policy_mutex))' + chr(10) +
+        '#define KSU_POLICY_SET(pol) rcu_assign_pointer(selinux_state.policy, (pol))' + chr(10) +
+        '#define KSU_POLICY_LOCK() mutex_lock(&selinux_state.policy_mutex)' + chr(10) +
+        '#define KSU_POLICY_UNLOCK() mutex_unlock(&selinux_state.policy_mutex)' + chr(10) +
+        '#endif' + chr(10))
+    s = s.replace(old, new, 1)
+    s = s.replace('mutex_lock(&selinux_state.policy_mutex);', 'KSU_POLICY_LOCK();')
+    s = s.replace('mutex_unlock(&selinux_state.policy_mutex);', 'KSU_POLICY_UNLOCK();')
+    s = s.replace('rcu_dereference_protected(selinux_state.policy, lockdep_is_held(&selinux_state.policy_mutex));', 'KSU_POLICY_GET();')
+    s = s.replace('rcu_assign_pointer(selinux_state.policy, pol);', 'KSU_POLICY_SET(pol);')
+    # 5.4 keeps sidtab/latest_granting in selinux_state.ss, not in selinux_policy;
+    # backup_sepolicy is only consumed by selinux_hide, so keep it policydb-only.
+    a = s.find('backup_sepolicy->sidtab = kzalloc')
+    if a != -1:
+        b = s.find('    pol = ksu_dup_sepolicy(old_pol);', a)
+        if b != -1:
+            s = s[:a] + '        (void)0;' + chr(10) + '    }' + chr(10) + s[b:]
+            print('rules.c: dropped 5.7+ sidtab backup block')
+    io.open(r, 'w', encoding='utf-8').write(s)
+    print('rules.c: policy field access guarded for 5.4')
+SEL54EOF
+fi
+if [ -f "$SEC" ] && ! grep -q ksu54_sepolicy_backport "$SEC"; then
+python3 - <<'SECPEOF'
+import base64
+ADD = chr(10) + base64.b64decode("Ly8gU1BEWC1MaWNlbnNlLUlkZW50aWZpZXI6IEdQTC0yLjAKLyogTGludXggNS40IGhhcyBubyBzdHJ1Y3Qgc2VsaW51eF9wb2xpY3kgKHNwbGl0IG91dCBpbiA1LjcpOyB0aGUgcG9saWN5IGRiCiAqIGxpdmVzIGluIHNlbGludXhfc3RhdGUuc3MtPnBvbGljeWRiIGd1YXJkZWQgYnkgcG9saWN5X3J3bG9jay4gS2VlcGluZyB0aGUKICogc2FtZSBrc3VfZHVwX3NlcG9saWN5KCkva3N1X2Rlc3Ryb3lfc2Vwb2xpY3koKSBzdXJmYWNlIGxldHMgRmluYVNVJ3MKICogYXBwbHlfa2VybmVsc3VfcnVsZXMoKSBydW4gdW5jaGFuZ2VkIG9uIDUuNC4KICovCiNpbmNsdWRlIDxsaW51eC9sb2NrZGVwLmg+CiNpbmNsdWRlIDxsaW51eC9yY3VwZGF0ZS5oPgojaW5jbHVkZSA8bGludXgvc2xhYi5oPgojaW5jbHVkZSA8bGludXgvdm1hbGxvYy5oPgojaW5jbHVkZSA8bGludXgvdmVyc2lvbi5oPgojaW5jbHVkZSAic3Mvc2VydmljZXMuaCIKI2luY2x1ZGUgInNlbGludXguaCIKI2luY2x1ZGUgInNlcG9saWN5LmgiCiNpbmNsdWRlICJrbG9nLmgiIC8vIElXWVUgcHJhZ21hOiBrZWVwCgp2b2lkIGtzdV9kZXN0cm95X3NlcG9saWN5KHN0cnVjdCBzZWxpbnV4X3BvbGljeSAqcG9sKQp7CiAgICBpZiAoIXBvbCkKICAgICAgICByZXR1cm47CiAgICBwb2xpY3lkYl9kZXN0cm95KCZwb2wtPnBvbGljeWRiKTsKICAgIGtmcmVlKHBvbCk7Cn0KCnN0cnVjdCBzZWxpbnV4X3BvbGljeSAqa3N1X2R1cF9zZXBvbGljeShzdHJ1Y3Qgc2VsaW51eF9wb2xpY3kgKm9sZF9wb2wpCnsKICAgIHN0cnVjdCBzZWxpbnV4X3BvbGljeSAqbmV3X3BvbDsKICAgIHN0cnVjdCBwb2xpY3lfZmlsZSBmcDsKICAgIHZvaWQgKmRhdGE7CiAgICBzaXplX3QgbGVuOwogICAgaW50IHJldDsKCiAgICBsZW4gPSBvbGRfcG9sLT5wb2xpY3lkYi5sZW47CiAgICBkYXRhID0gdm1hbGxvYyhsZW4pOwogICAgaWYgKCFkYXRhKQogICAgICAgIHJldHVybiBFUlJfUFRSKC1FTk9NRU0pOwoKICAgIGZwLmRhdGEgPSBkYXRhOwogICAgZnAubGVuID0gbGVuOwogICAgcmV0ID0gcG9saWN5ZGJfd3JpdGUoJm9sZF9wb2wtPnBvbGljeWRiLCAmZnApOwogICAgaWYgKHJldCkgewogICAgICAgIHByX2Vycigic2Vwb2xpY3k1NDogcG9saWN5ZGJfd3JpdGU6ICVkXG4iLCByZXQpOwogICAgICAgIGdvdG8gb3V0X2ZyZWVfZGF0YTsKICAgIH0KICAgIGxlbiAtPSBmcC5sZW47CgogICAgbmV3X3BvbCA9IGt6YWxsb2Moc2l6ZW9mKCpuZXdfcG9sKSwgR0ZQX0tFUk5FTCk7CiAgICBpZiAoIW5ld19wb2wpIHsKICAgICAgICByZXQgPSAtRU5PTUVNOwogICAgICAgIGdvdG8gb3V0X2ZyZWVfZGF0YTsKICAgIH0KCiAgICBmcC5kYXRhID0gZGF0YTsKICAgIGZwLmxlbiA9IGxlbjsKICAgIHJldCA9IHBvbGljeWRiX3JlYWQoJm5ld19wb2wtPnBvbGljeWRiLCAmZnApOwogICAgaWYgKHJldCkgewogICAgICAgIHByX2Vycigic2Vwb2xpY3k1NDogcG9saWN5ZGJfcmVhZDogJWRcbiIsIHJldCk7CiAgICAgICAga2ZyZWUobmV3X3BvbCk7CiAgICAgICAgZ290byBvdXRfZnJlZV9kYXRhOwogICAgfQogICAgbmV3X3BvbC0+cG9saWN5ZGIubGVuID0gbGVuOwogICAga3ZmcmVlKGRhdGEpOwogICAgcHJfaW5mbygic2Vwb2xpY3k1NDogZHVwIHBvbGljeWRiIG9rLCBsZW4gJXp1XG4iLCBsZW4pOwogICAgcmV0dXJuIG5ld19wb2w7CgpvdXRfZnJlZV9kYXRhOgogICAga3ZmcmVlKGRhdGEpOwogICAgcmV0dXJuIEVSUl9QVFIocmV0KTsKfQo=").decode()
+P = "KernelSU/kernel/selinux/sepolicy.c"
+mark = "ksu54_sepolicy_backport"
+s = open(P, encoding="utf-8").read()
+# neutralise the 5.7+ implementations, keep every other helper in the file
+import re
+s = re.sub(r"void ksu_destroy_sepolicy\(struct selinux_policy \*pol\)\s*\{.*?\n\}\n", "", s, count=1, flags=re.S)
+s = re.sub(r"struct selinux_policy \*ksu_dup_sepolicy\(struct selinux_policy \*old_pol\)\s*\{.*?\n\}\n", "", s, count=1, flags=re.S)
+a = s.find('static bool add_filename_trans(struct policydb *db', s.find('static bool add_genfscon('))
+if a != -1:
+    b = s.find('static bool add_genfscon(', a)
+    if b != -1:
+        stub = ('#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 8, 0)' + chr(10) + s[a:b] +
+            '#else' + chr(10) +
+            'static bool add_filename_trans(struct policydb *db, const char *s, const char *t, const char *c,' + chr(10) +
+            '                               const char *d, const char *o)' + chr(10) +
+            '{' + chr(10) +
+            '    (void)o;' + chr(10) +
+            '    return add_type_rule(db, s, t, c, d, AVTAB_TRANSITION);' + chr(10) +
+            '}' + chr(10) +
+            '#endif' + chr(10))
+        s = s[:a] + stub + s[b:]
+        print('sepolicy.c: add_filename_trans guarded for 5.4')
+s += ADD
+s += chr(10) + "/* ksu54_sepolicy_backport appplied */" + chr(10)
+open(P, "w", encoding="utf-8").write(s)
+print("sepolicy.c: v5.7 helpers replaced with 5.4 policydb backport")
+SECPEOF
+fi
+echo "=== [SUSFS] step 4e: selinux_hide backport - reuse 5.4 in-kernel SELinux services ==="
+SIH="$SUDIR/feature/selinux_hide.c"
+if [ -f "$SIH" ] && ! grep -q ksu54_selinux_hide_54 "$SIH"; then
+python3 - <<'SIHEOF'
+import io, sys
+
+P = "KernelSU/kernel/feature/selinux_hide.c"
+s = io.open(P, encoding="utf-8").read()
+
+# 1) enable(): 5.4 queries the live policy, drop the hard backup_sepolicy gate
+old_enable = '''    if (!backup_sepolicy) {
+        pr_err("no backup sepolicy available, please save feature and reboot to retry!\\n");
+        return -EAGAIN;
+    }
+'''
+new_enable = '    /* ksu54_selinux_hide_54: live policy queried directly, no backup sepolicy needed */\n'
+if old_enable not in s:
+    sys.exit("selinux_hide54: enable guard not found (upstream changed?)")
+s = s.replace(old_enable, new_enable, 1)
+
+# 2) drop_backup_if_unused(): shim struct selinux_policy owns no sidtab
+old_drop = '''        sidtab_destroy(backup_sepolicy->sidtab);
+        kfree(backup_sepolicy->sidtab);
+        ksu_destroy_sepolicy(backup_sepolicy);
+        backup_sepolicy = NULL;'''
+new_drop = '''        /* ksu54_selinux_hide_54: shim policy owns no sidtab */
+        backup_sepolicy = NULL;'''
+if old_drop not in s:
+    sys.exit("selinux_hide54: drop block not found (upstream changed?)")
+s = s.replace(old_drop, new_drop, 1)
+
+# 3) disable the 5.7+ policydb/sidtab internal rebuild
+marker = '/*\n * Caveat:  Mutates scontext.\n */'
+idx = s.find(marker)
+if idx < 0:
+    sys.exit("selinux_hide54: internals marker not found (upstream changed?)")
+head, tail = s[:idx], s[idx:]
+tail = ('#if 0 /* ksu54_selinux_hide_54: 5.7-only policydb/sidtab internals, unused on 5.4 */\n'
+        + tail + '\n#endif /* ksu54_selinux_hide_54 internals */\n')
+
+ADD = r'''
+/* ksu54_selinux_hide_54: Linux 5.4 keeps the live policy in
+ * selinux_state.ss->policydb, and its SELinux services take &selinux_state.
+ * Reuse them instead of rebuilding the 5.7+ policy/sidtab internals. */
+static int security_context_to_sid_with_policy(struct selinux_policy *policy, const char *scontext, u32 scontext_len,
+                                              u32 *sid, u32 def_sid, gfp_t gfp_flags, u32 *orig_sid_p, int *orig_rc_p)
+{
+    int rc;
+    (void)policy;
+    rc = security_context_to_sid_default(&selinux_state, scontext, scontext_len, sid, def_sid, gfp_flags);
+    if (orig_rc_p)
+        *orig_rc_p = rc;
+    if (orig_sid_p)
+        *orig_sid_p = rc ? SECSID_NULL : *sid;
+    return rc;
+}
+
+static int security_sid_to_context_with_policy(struct selinux_policy *policy, u32 sid, char **scontext,
+                                              u32 *scontext_len)
+{
+    (void)policy;
+    return security_sid_to_context(&selinux_state, sid, scontext, scontext_len);
+}
+
+static void security_compute_av_user_with_policy(struct selinux_policy *policy, u32 ssid, u32 tsid, u16 tclass,
+                                                struct av_decision *avd)
+{
+    (void)policy;
+    security_compute_av_user(&selinux_state, ssid, tsid, tclass, avd);
+}
+/* ksu54_selinux_hide_54 done */
+'''
+
+mid = (head + tail).replace("selinux_state.status_lock", "selinux_state.ss->status_lock")
+mid = mid.replace("selinux_state.status_page", "selinux_state.ss->status_page")
+mid = mid.replace("#ifndef CONFIG_KSU_SUSFS", "#if 1 /* ksu54: enable real selinux_hide under SUSFS */")
+mid = mid.replace("#ifdef CONFIG_KSU_SUSFS", "#if 0 /* ksu54: drop SUSFS no-op shortcut */")
+io.open(P, "w", encoding="utf-8").write(mid + ADD)
+print("selinux_hide.c: 5.4 backport applied (reuse in-kernel selinux services)")
+print("selinux_hide.c: status_lock/status_page remapped to selinux_state.ss->*")
+SIHEOF
+fi
+echo "=== [SUSFS] step4g: native-type oracle filter (snapshot pre-KSU policy types) ==="
+# 春秋/DirtySepolicy 的 context oracle 探测：KSU 注入的 type（含随机化后的 ksu_file、ksu 域）
+# 在原生 policy 里根本不存在 -> 三个 write 入口一律按"不存在"返回 -EINVAL。
+# 快照必须在 KSU 注入规则之前完成，所以在 apply_kernelsu_rules() 开头调用；snapshot
+# 失败时自动退回关键词黑名单（fail-safe），不会静默失效。
+python3 - <<'K54EOF'
+import io
+import sys
+
+SIH = "KernelSU/kernel/feature/selinux_hide.c"
+RULES = "KernelSU/kernel/selinux/rules.c"
+
+
+def load(p):
+    return io.open(p, encoding="utf-8").read()
+
+
+def save(p, s):
+    io.open(p, "w", encoding="utf-8").write(s)
+
+
+def once(s, old, new, tag):
+    if s.count(old) != 1:
+        sys.exit("ksu54-oracle: anchor '%s' count=%d (expected 1)" % (tag, s.count(old)))
+    return s.replace(old, new, 1)
+
+
+HELPERS = r'''
+
+/* ===== ksu54: native type whitelist (pre-KSU policy snapshot) =====
+ * 春秋 / DirtySepolicy 一类检测工具只能通过 selinuxfs 的三个 write 入口
+ * (context / access / setprocattr) "提问"。KSU 注入的 type（含 ksu_file、
+ * ksu 域等）在原生 policy 里并不存在，因此凡是"非原生 type"一律按
+ * 不存在返回 -EINVAL，等价于干净设备的答复。
+ *
+ * 判定顺序：关键词优先（防快照被污染），白名单兜底（覆盖未知新 type）。
+ */
+static char **ksu54_native_types;
+static int ksu54_native_type_count;
+static bool ksu54_snapshot_tried;
+
+static const char *const ksu54_suspect_words[] = {
+	"ksu", "susfs", "lsposed", "magisk", "xposed", "riru",
+	"zygisk", "tricky", "sukisu", "apatch", "kernelsu",
+};
+
+#define KSU54_SUSPECT_N (sizeof(ksu54_suspect_words) / sizeof(ksu54_suspect_words[0]))
+
+static bool ksu54_type_is_native(const char *type, size_t tlen)
+{
+	int i;
+
+	if (ksu54_native_type_count <= 0)
+		return true;
+
+	for (i = 0; i < ksu54_native_type_count; i++) {
+		const char *n = ksu54_native_types[i];
+
+		if (n && strlen(n) == tlen && !memcmp(n, type, tlen))
+			return true;
+	}
+	return false;
+}
+
+/* 从 "user:role:type[:mls]" 取第 3 段（type）。 */
+static bool ksu54_parse_type_component(const char *s, size_t len, const char **type,
+				       size_t *tlen)
+{
+	size_t i, start = 0;
+	int colons = 0;
+
+	for (i = 0; i < len; i++) {
+		if (s[i] != ':')
+			continue;
+		colons++;
+		if (colons == 2) {
+			start = i + 1;
+		} else if (colons == 3) {
+			if (i <= start)
+				return false;
+			*type = s + start;
+			*tlen = i - start;
+			return true;
+		}
+	}
+	return false;
+}
+
+static bool ksu54_word_suspect(const char *s, size_t len)
+{
+	char tmp[160];
+	size_t n, i;
+
+	if (!s || !len)
+		return false;
+	n = len < sizeof(tmp) - 1 ? len : sizeof(tmp) - 1;
+	memcpy(tmp, s, n);
+	tmp[n] = 0;
+	for (i = 0; i < KSU54_SUSPECT_N; i++) {
+		if (strstr(tmp, ksu54_suspect_words[i]))
+			return true;
+	}
+	return false;
+}
+
+bool ksu54_context_is_foreign(const char *s, size_t len)
+{
+	const char *type;
+	size_t tlen;
+	char tmp[96];
+	size_t n;
+	bool foreign;
+	static int dbg;
+
+	if (!s || !len)
+		return false;
+	while (len && (s[len - 1] == '\n' || s[len - 1] == ' ' || s[len - 1] == '\t'))
+		len--;
+	if (!len)
+		return false;
+
+	if (ksu54_word_suspect(s, len)) {
+		foreign = true;
+	} else if (ksu54_native_type_count <= 0) {
+		foreign = false;
+	} else if (!ksu54_parse_type_component(s, len, &type, &tlen)) {
+		foreign = false;
+	} else {
+		foreign = !ksu54_type_is_native(type, tlen);
+	}
+
+	if (dbg < 40) {
+		dbg++;
+		n = len < sizeof(tmp) - 1 ? len : sizeof(tmp) - 1;
+		memcpy(tmp, s, n);
+		tmp[n] = 0;
+		pr_info("ksu54: oracle \"%s\" cnt=%d foreign=%d\n", tmp,
+			ksu54_native_type_count, (int)foreign);
+	}
+	return foreign;
+}
+
+void ksu54_snapshot_native_types(void)
+{
+	struct policydb *pol;
+	struct hashtab *ht;
+	char **arr = NULL;
+	int cap = 0, n = 0;
+	u32 i;
+
+	/* only try once: apply_kernelsu_rules may run multiple times, a retry
+	 * would snapshot an already KSU-polluted policy */
+	if (ksu54_snapshot_tried)
+		return;
+	ksu54_snapshot_tried = true;
+
+	if (!selinux_state.ss) {
+		pr_warn("ksu54: snapshot skipped, selinux_state.ss is NULL\n");
+		return;
+	}
+	pol = &selinux_state.ss->policydb;
+	/* 5.4 ??: struct policydb { struct symtab p_types; },
+	 * struct symtab { struct hashtab *table; } */
+	ht = pol->p_types.table;
+	if (!ht) {
+		pr_warn("ksu54: snapshot skipped, p_types.table is NULL\n");
+		return;
+	}
+
+	for (i = 0; i < ht->size; i++) {
+		struct hashtab_node *node;
+
+		for (node = ht->htable[i]; node; node = node->next) {
+			const char *name = node->key;
+			size_t l;
+			char *cp;
+
+			if (!name)
+				continue;
+			l = strlen(name);
+			if (n >= cap) {
+				int ncap = cap ? cap * 2 : 2048;
+				char **na = kcalloc(ncap, sizeof(*na), GFP_KERNEL);
+
+				if (!na)
+					goto done;
+				if (arr) {
+					memcpy(na, arr, n * sizeof(*na));
+					kfree(arr);
+				}
+				arr = na;
+				cap = ncap;
+			}
+			cp = kmalloc(l + 1, GFP_KERNEL);
+			if (!cp)
+				goto done;
+			memcpy(cp, name, l + 1);
+			arr[n++] = cp;
+		}
+	}
+done:
+	ksu54_native_types = arr;
+	ksu54_native_type_count = n;
+	pr_info("ksu54: snapshot %d native SELinux types\n", n);
+}
+
+/* ===== ksu54: mask root-only grants in SELinux access oracle =====
+ * 春秋 / DirtySepolicy 直接向 /sys/fs/selinux/access 发哨兵查询。下面这些
+ * allow 在干净 AOSP user build 上是 deny，一旦返回 allow 就会被判成
+ * root / 模块注入。这里把对应位剥掉，返回干净值。
+ */
+struct ksu54_mask_rule {
+	const char *scon;
+	const char *tcon;
+	const char *perm;
+};
+
+static const struct ksu54_mask_rule ksu54_mask_rules[] = {
+	{ "u:r:system_server:s0", "u:r:system_server:s0", "execmem" },
+	{ "u:r:zygote:s0", "u:object_r:adb_data_file:s0", "search" },
+	{ "u:r:shell:s0", "u:r:su:s0", "transition" },
+	{ "u:r:kernel:s0", "u:object_r:adb_data_file:s0", "read" },
+	{ "u:r:system_server:s0", "u:object_r:apk_data_file:s0", "execute" },
+	{ "u:r:dex2oat:s0", "u:object_r:dex2oat_exec:s0", "execute_no_trans" },
+	{ "u:object_r:rootfs:s0", "u:object_r:tmpfs:s0", "associate" },
+	{ "u:r:kernel:s0", "u:object_r:tmpfs:s0", "open" },
+};
+
+/* 比较 user:role:type 三段是否相同（忽略 MLS/category） */
+static bool ksu54_head_eq(const char *a, const char *b)
+{
+	int i;
+
+	if (!a || !b)
+		return false;
+	for (i = 0; i < 2; i++) {
+		while (*a && *a != ':') {
+			if (*b != *a)
+				return false;
+			a++;
+			b++;
+		}
+		if (*a != ':' || *b != ':')
+			return false;
+		a++;
+		b++;
+	}
+	while (*a && *a != ':') {
+		if (*b != *a)
+			return false;
+		a++;
+		b++;
+	}
+	return *b == ':' || *b == '\0';
+}
+
+static u32 ksu54_symtab_perm_bit(struct symtab *st, const char *perm)
+{
+	struct hashtab *ht;
+	u32 i;
+
+	if (!st || !st->table)
+		return 0;
+	ht = st->table;
+	for (i = 0; i < ht->size; i++) {
+		struct hashtab_node *node;
+
+		for (node = ht->htable[i]; node; node = node->next) {
+			struct perm_datum *pd;
+
+			if (!node->key || strcmp((const char *)node->key, perm))
+				continue;
+			pd = node->datum;
+			if (pd && pd->value)
+				return 1u << (pd->value - 1);
+		}
+	}
+	return 0;
+}
+
+static u32 ksu54_perm_bit(u16 tclass, const char *perm)
+{
+	struct policydb *pol;
+	struct class_datum *clad;
+	u32 bit;
+
+	if (!perm || !selinux_state.ss)
+		return 0;
+	pol = &selinux_state.ss->policydb;
+	if (!pol->class_val_to_struct || !tclass || tclass > pol->p_classes.nprim)
+		return 0;
+	clad = pol->class_val_to_struct[tclass - 1];
+	if (!clad)
+		return 0;
+	/* class-specific permissions，再回退到 common（read/execute 常在 common file 里） */
+	bit = ksu54_symtab_perm_bit(&clad->permissions, perm);
+	if (!bit && clad->comdatum)
+		bit = ksu54_symtab_perm_bit(&clad->comdatum->permissions, perm);
+	return bit;
+}
+
+void ksu54_mask_avd(const char *scon, const char *tcon, u16 tclass, struct av_decision *avd)
+{
+	int i;
+
+	if (!scon || !tcon || !avd)
+		return;
+	for (i = 0; i < (int)(sizeof(ksu54_mask_rules) / sizeof(ksu54_mask_rules[0])); i++) {
+		const struct ksu54_mask_rule *r = &ksu54_mask_rules[i];
+		u32 bit;
+
+		if (!ksu54_head_eq(scon, r->scon) || !ksu54_head_eq(tcon, r->tcon))
+			continue;
+		bit = ksu54_perm_bit(tclass, r->perm);
+		if (!bit)
+			continue;
+		if (avd->allowed & bit) {
+			avd->allowed &= ~bit;
+			pr_info("ksu54: mask avd %s -> %s perm=%s\n", r->scon, r->tcon, r->perm);
+		}
+	}
+}
+
+'''
+
+# ---------- 1) rules.c ----------
+s = load(RULES)
+if "ksu54_context_is_foreign" in s:
+    print("rules.c already patched, skip")
+else:
+    s = once(s, "\nstruct selinux_policy *backup_sepolicy;",
+             "\nstruct selinux_policy *backup_sepolicy;" + HELPERS, "backup_sepolicy decl")
+    s = once(s, "void apply_kernelsu_rules()\n{",
+             "void apply_kernelsu_rules()\n{\n\tksu54_snapshot_native_types();\n",
+             "apply_kernelsu_rules")
+    save(RULES, s)
+    print("rules.c: helpers + snapshot call injected")
+
+# ---------- 2) selinux_hide.c ----------
+s = load(SIH)
+if "ksu54_context_is_foreign" in s:
+    print("selinux_hide.c already patched, skip")
+else:
+    s = once(s, "bool ksu_selinux_hide_running __read_mostly = false;",
+             "bool ksu_selinux_hide_running __read_mostly = false;\n\n"
+             "extern bool ksu54_context_is_foreign(const char *s, size_t len);\nextern void ksu54_mask_avd(const char *scon, const char *tcon, u16 tclass, struct av_decision *avd);",
+             "hide_running decl")
+    s = once(s,
+             "    char *canon = NULL;\n    u32 sid, len;\n    ssize_t length;\n",
+             "    char *canon = NULL;\n    u32 sid, len;\n    ssize_t length;\n"
+             "\n    pr_info(\"ksu54: ctx-write uid=%u size=%zu\\n\", current_uid().val, size);\n"
+             "    if (ksu54_context_is_foreign(buf, size))\n        return -EINVAL;\n",
+             "write_context body")
+    s = once(s,
+             "    sconlen = strlen(scon);\n    tconlen = strlen(tcon);\n",
+             "    sconlen = strlen(scon);\n    tconlen = strlen(tcon);\n"
+             "\n    pr_info(\"ksu54: acc-write uid=%u s=%s t=%s\\n\", current_uid().val, scon, tcon);\n"
+             "    if (ksu54_context_is_foreign(scon, sconlen) || ksu54_context_is_foreign(tcon, tconlen)) {\n"
+             "        length = -EINVAL;\n        goto out;\n    }\n",
+             "write_access body")
+    # v1.4.x: `if (size && str[0] && str[0] != '\n') {`
+    # v1.5.0 drops the trailing `&& str[0] != '\n'` (it trims the newline below anyway)
+    setproc_anchor = None
+    for cand in ("    if (size && str[0] && str[0] != '\\n') {\n",
+                 "    if (size && str[0]) {\n"):
+        if s.count(cand) == 1:
+            setproc_anchor = cand
+            break
+    if setproc_anchor is None:
+        sys.exit("ksu54-oracle: setprocattr anchor not found (v1.4=%d v1.5=%d)" % (
+            s.count("    if (size && str[0] && str[0] != '\\n') {\n"),
+            s.count("    if (size && str[0]) {\n")))
+    s = s.replace(setproc_anchor,
+                  setproc_anchor +
+                  "        if (ksu54_context_is_foreign(str, size))\n            return -EINVAL;\n",
+                  1)
+    s = once(s,
+             "    security_compute_av_user_with_policy(backup_sepolicy, ssid, tsid, tclass, &avd);\n"
+             "\n    // stock reads 1;",
+             "    security_compute_av_user_with_policy(backup_sepolicy, ssid, tsid, tclass, &avd);\n"
+             "    ksu54_mask_avd(scon, tcon, tclass, &avd);\n"
+             "\n    // stock reads 1;",
+             "write_access mask")
+    save(SIH, s)
+    print("selinux_hide.c: extern + 3 filter sites injected")
+
+# ---------- 3) verify ----------
+r = load(RULES)
+h = load(SIH)
+print("rules.c: snapshot def =", r.count("void ksu54_snapshot_native_types(void)"),
+      "| call =", r.count("ksu54_snapshot_native_types();"),
+      "| parsed3 =", r.count("colons == 3"))
+print("selinux_hide.c: ctx-write log =", h.count("ksu54: ctx-write"),
+      "| acc-write log =", h.count("ksu54: acc-write"))
+print("braces rules.c:", r.count("{") - r.count("}"),
+      "| hide.c:", h.count("{") - h.count("}"))
+K54EOF
+
+echo "=== [SUSFS] step 5: 5.4 has no seccomp syscall cache (added in 5.9) ==="
+SCC="$SUDIR/infra/seccomp_cache.c"
+if [ -f "$SCC" ] && ! grep -q ksu54_seccomp_stub "$SCC"; then
+cat > "$SCC" <<'SCCEOF'
+/* ksu54_seccomp_stub: Linux 5.4 has no seccomp syscall bitmap cache
+ * (that landed in 5.9 together with struct action_cache). FinaSU only uses
+ * these to pre-allow __NR_reboot for the manager uid; on 5.4 the syscall is
+ * simply evaluated by the normal filter path, so both helpers are no-ops.
+ */
+#include <linux/fs.h>
+#include <linux/seccomp.h>
+#include "klog.h" // IWYU pragma: keep
+#include "infra/seccomp_cache.h"
+
+void ksu_seccomp_clear_cache(struct seccomp_filter *filter, int nr)
+{
+(void)filter;
+(void)nr;
+}
+
+void ksu_seccomp_allow_cache(struct seccomp_filter *filter, int nr)
+{
+(void)filter;
+(void)nr;
+}
+SCCEOF
+echo "seccomp_cache.c replaced with 5.4 no-op stub"
+fi
+
+echo "=== [SUSFS] step 5: 5.4 has no seccomp syscall cache (added in 5.9) ==="
+SCC="$SUDIR/infra/seccomp_cache.c"
+if [ -f "$SCC" ] && ! grep -q ksu54_seccomp_stub "$SCC"; then
+cat > "$SCC" <<'SCCEOF'
+/* ksu54_seccomp_stub: Linux 5.4 has no seccomp syscall bitmap cache
+ * (that landed in 5.9 together with struct action_cache). FinaSU only uses
+ * these to pre-allow __NR_reboot for the manager uid; on 5.4 the syscall is
+ * simply evaluated by the normal filter path, so both helpers are no-ops.
+ */
+#include <linux/fs.h>
+#include <linux/seccomp.h>
+#include "klog.h" // IWYU pragma: keep
+#include "infra/seccomp_cache.h"
+
+void ksu_seccomp_clear_cache(struct seccomp_filter *filter, int nr)
+{
+(void)filter;
+(void)nr;
+}
+
+void ksu_seccomp_allow_cache(struct seccomp_filter *filter, int nr)
+{
+(void)filter;
+(void)nr;
+}
+SCCEOF
+echo "seccomp_cache.c replaced with 5.4 no-op stub"
+fi
+
+echo "=== [SUSFS] step 6: 5.4 fsnotify backport for pkg_observer.c ==="
+POB="$SUDIR/manager/pkg_observer.c"
+if [ -f "$POB" ] && ! grep -q ksu54_pkg_observer "$POB"; then
+python3 - <<'POBEOF'
+import base64
+src = base64.b64decode('Ly8gU1BEWC1MaWNlbnNlLUlkZW50aWZpZXI6IEdQTC0yLjAKLyoga3N1NTRfcGtnX29ic2VydmVyOiBMaW51eCA1LjQgYmFjay1wb3J0IG9mIEZpbmFTVSBwa2dfb2JzZXJ2ZXIuYyAqLwojaW5jbHVkZSA8bGludXgvbW9kdWxlLmg+CiNpbmNsdWRlIDxsaW51eC9mcy5oPgojaW5jbHVkZSA8bGludXgvbmFtZWkuaD4KI2luY2x1ZGUgPGxpbnV4L2Zzbm90aWZ5X2JhY2tlbmQuaD4KI2luY2x1ZGUgPGxpbnV4L3NjaGVkLmg+CiNpbmNsdWRlIDxsaW51eC9zbGFiLmg+CiNpbmNsdWRlIDxsaW51eC9yY3VsaXN0Lmg+CiNpbmNsdWRlIDxsaW51eC90YXNrX3dvcmsuaD4KI2luY2x1ZGUgPGxpbnV4L3ZlcnNpb24uaD4KI2luY2x1ZGUgImtsb2cuaCIKI2luY2x1ZGUgIm1hbmFnZXIvdGhyb25lX3RyYWNrZXIuaCIKCiNkZWZpbmUgTUFTS19TWVNURU0gKEZTX0NSRUFURSB8IEZTX01PVkUgfCBGU19FVkVOVF9PTl9DSElMRCkKCnN0cnVjdCB3YXRjaF9kaXIgewogICAgY29uc3QgY2hhciAqcGF0aDsKICAgIHUzMiBtYXNrOwogICAgc3RydWN0IHBhdGgga3BhdGg7CiAgICBzdHJ1Y3QgaW5vZGUgKmlub2RlOwogICAgc3RydWN0IGZzbm90aWZ5X21hcmsgKm1hcms7Cn07CgpzdGF0aWMgc3RydWN0IGZzbm90aWZ5X2dyb3VwICpnOwoKc3RhdGljIHZvaWQga3N1X3RyYWNrX3Rocm9uZV90d19mdW5jKHN0cnVjdCBjYWxsYmFja19oZWFkICpjYikKewogICAga2ZyZWUoY2IpOwogICAgaWYgKGN1cnJlbnQtPmZsYWdzICYgUEZfRVhJVElORykKICAgICAgICByZXR1cm47CiAgICB0cmFja190aHJvbmUoZmFsc2UpOwp9CgpzdGF0aWMgdm9pZCBrc3VfZGVmZXJfdHJhY2tfdGhyb25lKHZvaWQpCnsKICAgIHN0cnVjdCBjYWxsYmFja19oZWFkICpjYjsKCiAgICBpZiAoIShjdXJyZW50LT5mbGFncyAmIFBGX0tUSFJFQUQpKSB7CiAgICAgICAgY2IgPSBremFsbG9jKHNpemVvZigqY2IpLCBHRlBfS0VSTkVMKTsKICAgICAgICBpZiAoY2IpIHsKICAgICAgICAgICAgY2ItPmZ1bmMgPSBrc3VfdHJhY2tfdGhyb25lX3R3X2Z1bmM7CiAgICAgICAgICAgIGlmICghdGFza193b3JrX2FkZChjdXJyZW50LCBjYiwgdHJ1ZSkpCiAgICAgICAgICAgICAgICByZXR1cm47CiAgICAgICAgICAgIGtmcmVlKGNiKTsKICAgICAgICB9CiAgICB9CiAgICBwcl93YXJuKCJkZWZlciB0cmFja190aHJvbmUgZmFpbGVkLCBydW4gaXQgaW5saW5lIik7CiAgICB0cmFja190aHJvbmUoZmFsc2UpOwp9CgpzdGF0aWMgaW50IGtzdV9oYW5kbGVfZXZlbnQoc3RydWN0IGZzbm90aWZ5X2dyb3VwICpncm91cCwgc3RydWN0IGlub2RlICppbm9kZSwKICAgICAgICAgICAgICAgICAgICAgICAgICAgIHUzMiBtYXNrLCBjb25zdCB2b2lkICpkYXRhLCBpbnQgZGF0YV90eXBlLAogICAgICAgICAgICAgICAgICAgICAgICAgICAgY29uc3Qgc3RydWN0IHFzdHIgKmZpbGVfbmFtZSwgdTMyIGNvb2tpZSwKICAgICAgICAgICAgICAgICAgICAgICAgICAgIHN0cnVjdCBmc25vdGlmeV9pdGVyX2luZm8gKml0ZXJfaW5mbykKewogICAgKHZvaWQpZ3JvdXA7CiAgICAodm9pZClpbm9kZTsKICAgICh2b2lkKWRhdGE7CiAgICAodm9pZClkYXRhX3R5cGU7CiAgICAodm9pZCljb29raWU7CiAgICAodm9pZClpdGVyX2luZm87CgogICAgaWYgKCFmaWxlX25hbWUpCiAgICAgICAgcmV0dXJuIDA7CiAgICBpZiAobWFzayAmIEZTX0lTRElSKQogICAgICAgIHJldHVybiAwOwogICAgaWYgKGZpbGVfbmFtZS0+bGVuID09IDEzICYmICFtZW1jbXAoZmlsZV9uYW1lLT5uYW1lLCAicGFja2FnZXMubGlzdCIsIDEzKSkgewogICAgICAgIHByX2luZm8oInBhY2thZ2VzLmxpc3QgZGV0ZWN0ZWQ6ICV1IiwgbWFzayk7CiAgICAgICAga3N1X2RlZmVyX3RyYWNrX3Rocm9uZSgpOwogICAgfQogICAgcmV0dXJuIDA7Cn0KCnN0YXRpYyBjb25zdCBzdHJ1Y3QgZnNub3RpZnlfb3BzIGtzdV9vcHMgPSB7CiAgICAuaGFuZGxlX2V2ZW50ID0ga3N1X2hhbmRsZV9ldmVudCwKfTsKCnN0YXRpYyBpbnQgYWRkX21hcmtfb25faW5vZGUoc3RydWN0IGlub2RlICppbm9kZSwgdTMyIG1hc2ssIHN0cnVjdCBmc25vdGlmeV9tYXJrICoqb3V0KQp7CiAgICBzdHJ1Y3QgZnNub3RpZnlfbWFyayAqbTsKICAgIGludCByZXQ7CgogICAgbSA9IGt6YWxsb2Moc2l6ZW9mKCptKSwgR0ZQX0tFUk5FTCk7CiAgICBpZiAoIW0pCiAgICAgICAgcmV0dXJuIC1FTk9NRU07CiAgICBmc25vdGlmeV9pbml0X21hcmsobSwgZyk7CiAgICBtLT5tYXNrID0gbWFzazsKICAgIHJldCA9IGZzbm90aWZ5X2FkZF9pbm9kZV9tYXJrKG0sIGlub2RlLCAwKTsKICAgIGlmIChyZXQpIHsKICAgICAgICBmc25vdGlmeV9wdXRfbWFyayhtKTsKICAgICAgICByZXR1cm4gLUVJTlZBTDsKICAgIH0KICAgICpvdXQgPSBtOwogICAgcmV0dXJuIDA7Cn0KCnN0YXRpYyBpbnQgd2F0Y2hfb25lX2RpcihzdHJ1Y3Qgd2F0Y2hfZGlyICp3ZCkKewogICAgaW50IHJldDsKCiAgICByZXQgPSBrZXJuX3BhdGgod2QtPnBhdGgsIExPT0tVUF9GT0xMT1csICZ3ZC0+a3BhdGgpOwogICAgaWYgKHJldCkgewogICAgICAgIHByX2luZm8oInBhdGggbm90IHJlYWR5OiAlcyAoJWQpIiwgd2QtPnBhdGgsIHJldCk7CiAgICAgICAgcmV0dXJuIHJldDsKICAgIH0KICAgIHdkLT5pbm9kZSA9IGRfaW5vZGUod2QtPmtwYXRoLmRlbnRyeSk7CiAgICBpaG9sZCh3ZC0+aW5vZGUpOwogICAgcmV0ID0gYWRkX21hcmtfb25faW5vZGUod2QtPmlub2RlLCB3ZC0+bWFzaywgJndkLT5tYXJrKTsKICAgIGlmIChyZXQpIHsKICAgICAgICBwcl9lcnIoIkFkZCBtYXJrIGZhaWxlZCBmb3IgJXMgKCVkKSIsIHdkLT5wYXRoLCByZXQpOwogICAgICAgIHBhdGhfcHV0KCZ3ZC0+a3BhdGgpOwogICAgICAgIGlwdXQod2QtPmlub2RlKTsKICAgICAgICB3ZC0+aW5vZGUgPSBOVUxMOwogICAgICAgIHJldHVybiByZXQ7CiAgICB9CiAgICBwcl9pbmZvKCJ3YXRjaGluZyAlcyIsIHdkLT5wYXRoKTsKICAgIHJldHVybiAwOwp9CgpzdGF0aWMgdm9pZCB1bndhdGNoX29uZV9kaXIoc3RydWN0IHdhdGNoX2RpciAqd2QpCnsKICAgIGlmICh3ZC0+bWFyaykgewogICAgICAgIGZzbm90aWZ5X2Rlc3Ryb3lfbWFyayh3ZC0+bWFyaywgZyk7CiAgICAgICAgZnNub3RpZnlfcHV0X21hcmsod2QtPm1hcmspOwogICAgICAgIHdkLT5tYXJrID0gTlVMTDsKICAgIH0KICAgIGlmICh3ZC0+aW5vZGUpIHsKICAgICAgICBpcHV0KHdkLT5pbm9kZSk7CiAgICAgICAgd2QtPmlub2RlID0gTlVMTDsKICAgIH0KICAgIGlmICh3ZC0+a3BhdGguZGVudHJ5KSB7CiAgICAgICAgcGF0aF9wdXQoJndkLT5rcGF0aCk7CiAgICAgICAgbWVtc2V0KCZ3ZC0+a3BhdGgsIDAsIHNpemVvZih3ZC0+a3BhdGgpKTsKICAgIH0KfQoKc3RhdGljIHN0cnVjdCB3YXRjaF9kaXIgZ193YXRjaCA9IHsgLnBhdGggPSAiL2RhdGEvc3lzdGVtIiwgLm1hc2sgPSBNQVNLX1NZU1RFTSB9OwoKaW50IGtzdV9vYnNlcnZlcl9pbml0KHZvaWQpCnsKICAgIGludCByZXQ7CgogICAgZyA9IGZzbm90aWZ5X2FsbG9jX2dyb3VwKCZrc3Vfb3BzKTsKICAgIGlmIChJU19FUlIoZykpCiAgICAgICAgcmV0dXJuIFBUUl9FUlIoZyk7CiAgICByZXQgPSB3YXRjaF9vbmVfZGlyKCZnX3dhdGNoKTsKICAgIHByX2luZm8oIm9ic2VydmVyIGluaXQgZG9uZSIpOwogICAgcmV0dXJuIDA7Cn0KCnZvaWQga3N1X29ic2VydmVyX2V4aXQodm9pZCkKewogICAgdW53YXRjaF9vbmVfZGlyKCZnX3dhdGNoKTsKICAgIGZzbm90aWZ5X3B1dF9ncm91cChnKTsKICAgIHByX2luZm8oIm9ic2VydmVyIGV4aXQgZG9uZSIpOwp9Cg==').decode()
+open("KernelSU/kernel/manager/pkg_observer.c", "w").write(src)
+print("pkg_observer.c rewritten for 5.4 fsnotify API")
+POBEOF
+fi
+
+echo "=== [SUSFS] step 7: export 5.4 mount helpers + retarget FinaSU mount calls ==="
+# FinaSU calls path_mount()/path_umount() (Linux 5.8+). On 5.4 the equivalents
+# are do_mount() (non-static) and ksys_umount() (path-string based). Both are
+# unexported, so export them, then retarget the two FinaSU call sites.
+NSC="$KDIR/fs/namespace.c"
+if [ -f "$NSC" ] && ! grep -q 'EXPORT_SYMBOL(do_mount)' "$NSC"; then
+python3 - <<'NSCEOF'
+import base64
+src = base64.b64decode('cCA9ICJmcy9uYW1lc3BhY2UuYyIKcyA9IG9wZW4ocCkucmVhZCgpCgphbmNob3IgPSAibG9uZyBkb19tb3VudChjb25zdCBjaGFyICpkZXZfbmFtZSwgY29uc3QgY2hhciBfX3VzZXIgKmRpcl9uYW1lLCIKaWR4ID0gcy5maW5kKGFuY2hvcikKaWYgaWR4IDwgMDoKICAgIHByaW50KCJkb19tb3VudCBkZWZpbml0aW9uIG5vdCBmb3VuZCwgc2tpcHBlZCIpCiAgICByYWlzZSBTeXN0ZW1FeGl0KDApCgplbmQgPSBzLmZpbmQoIlxufVxuIiwgaWR4KQppZiBlbmQgPCAwOgogICAgcHJpbnQoImRvX21vdW50IGVuZCBub3QgZm91bmQsIHNraXBwZWQiKQogICAgcmFpc2UgU3lzdGVtRXhpdCgwKQplbmQgKz0gMwpzID0gc1s6ZW5kXSArICJFWFBPUlRfU1lNQk9MKGRvX21vdW50KTtcbiIgKyBzW2VuZDpdCgppID0gcy5maW5kKCJpbnQga3N5c191bW91bnQoY2hhciBfX3VzZXIgKm5hbWUsIGludCBmbGFncykiKQppZiBpIDwgMDoKICAgIHByaW50KCJrc3lzX3Vtb3VudCBkZWZpbml0aW9uIG5vdCBmb3VuZCwgc2tpcHBlZCIpCiAgICByYWlzZSBTeXN0ZW1FeGl0KDApCmogPSBzLmZpbmQoIlxufVxuIiwgaSkKaWYgaiA8IDA6CiAgICBwcmludCgia3N5c191bW91bnQgZW5kIG5vdCBmb3VuZCwgc2tpcHBlZCIpCiAgICByYWlzZSBTeXN0ZW1FeGl0KDApCmogKz0gMwpzID0gc1s6al0gKyAiRVhQT1JUX1NZTUJPTChrc3lzX3Vtb3VudCk7XG4iICsgc1tqOl0KCm9wZW4ocCwgInciKS53cml0ZShzKQpwcmludCgibmFtZXNwYWNlLmM6IGV4cG9ydGVkIGRvX21vdW50ICsga3N5c191bW91bnQiKQo=').decode()
+exec(compile(src, '<nsc_fix>', 'exec'))
+NSCEOF
+fi
+SMN="$SUDIR/infra/su_mount_ns.c"
+if [ -f "$SMN" ] && grep -q 'path_mount' "$SMN"; then
+python3 - "$SMN" <<'SMNEOF'
+import sys, base64
+src = base64.b64decode('aW1wb3J0IHN5cwoKcCA9IHN5cy5hcmd2WzFdCnMgPSBvcGVuKHApLnJlYWQoKQoKb2xkID0gImV4dGVybiBpbnQgcGF0aF9tb3VudChjb25zdCBjaGFyICpkZXZfbmFtZSwgc3RydWN0IHBhdGggKnBhdGgsIGNvbnN0IGNoYXIgKnR5cGVfcGFnZSwgdW5zaWduZWQgbG9uZyBmbGFncyxcbiAgICAgICAgICAgICAgICAgICAgICB2b2lkICpkYXRhX3BhZ2UpOyIKbmV3ID0gKCIvKiA1LjQgaGFzIG5vIHBhdGhfbW91bnQoKTsgZG9fbW91bnQoKSB0YWtlcyBhIF9fdXNlciBkaXJfbmFtZS4gKi9cbiIKICAgICAgICJleHRlcm4gbG9uZyBkb19tb3VudChjb25zdCBjaGFyICpkZXZfbmFtZSwgY29uc3QgY2hhciBfX3VzZXIgKmRpcl9uYW1lLFxuIgogICAgICAgIiAgICAgICAgICAgICAgICAgICAgIGNvbnN0IGNoYXIgKnR5cGVfcGFnZSwgdW5zaWduZWQgbG9uZyBmbGFncyxcbiIKICAgICAgICIgICAgICAgICAgICAgICAgICAgICB2b2lkICpkYXRhX3BhZ2UpOyIpCmlmIG9sZCBub3QgaW4gczoKICAgIHByaW50KCJwYXRoX21vdW50IGRlY2wgYW5jaG9yIG5vdCBmb3VuZCwgc2tpcHBlZCIpCiAgICByYWlzZSBTeXN0ZW1FeGl0KDApCnMgPSBzLnJlcGxhY2Uob2xkLCBuZXcsIDEpCgpvbGRfY2FsbCA9ICJpbnQgcG1fcmV0ID0gcGF0aF9tb3VudChOVUxMLCAmcm9vdF9wYXRoLCBOVUxMLCBNU19QUklWQVRFIHwgTVNfUkVDLCBOVUxMKTsiCm5ld19jYWxsID0gKCJpbnQgcG1fcmV0O1xuIgogICAgICAgICAgICAiICAgIHtcbiIKICAgICAgICAgICAgIiAgICAgICAgY2hhciAqZGlyID0ga21hbGxvYyhQQVRIX01BWCwgR0ZQX0tFUk5FTCk7XG4iCiAgICAgICAgICAgICIgICAgICAgIGlmIChkaXIpIHtcbiIKICAgICAgICAgICAgIiAgICAgICAgICAgIGNoYXIgKnAyID0gZF9wYXRoKCZyb290X3BhdGgsIGRpciwgUEFUSF9NQVgpO1xuIgogICAgICAgICAgICAiICAgICAgICAgICAgaWYgKCFJU19FUlIocDIpKSB7XG4iCiAgICAgICAgICAgICIgICAgICAgICAgICAgICAgbW1fc2VnbWVudF90IG9sZGZzID0gZ2V0X2ZzKCk7XG4iCiAgICAgICAgICAgICIgICAgICAgICAgICAgICAgc2V0X2ZzKEtFUk5FTF9EUyk7XG4iCiAgICAgICAgICAgICIgICAgICAgICAgICAgICAgcG1fcmV0ID0gKGludClkb19tb3VudChOVUxMLCAoY29uc3QgY2hhciBfX3VzZXIgKilwMixcbiIKICAgICAgICAgICAgIiAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgTlVMTCwgTVNfUFJJVkFURSB8IE1TX1JFQywgTlVMTCk7XG4iCiAgICAgICAgICAgICIgICAgICAgICAgICAgICAgc2V0X2ZzKG9sZGZzKTtcbiIKICAgICAgICAgICAgIiAgICAgICAgICAgIH0gZWxzZSB7XG4iCiAgICAgICAgICAgICIgICAgICAgICAgICAgICAgcG1fcmV0ID0gKGludClQVFJfRVJSKHAyKTtcbiIKICAgICAgICAgICAgIiAgICAgICAgICAgIH1cbiIKICAgICAgICAgICAgIiAgICAgICAgICAgIGtmcmVlKGRpcik7XG4iCiAgICAgICAgICAgICIgICAgICAgIH0gZWxzZSB7XG4iCiAgICAgICAgICAgICIgICAgICAgICAgICBwbV9yZXQgPSAtRU5PTUVNO1xuIgogICAgICAgICAgICAiICAgICAgICB9XG4iCiAgICAgICAgICAgICIgICAgfSIpCmlmIG9sZF9jYWxsIG5vdCBpbiBzOgogICAgcHJpbnQoInBhdGhfbW91bnQgY2FsbCBhbmNob3Igbm90IGZvdW5kLCBza2lwcGVkIikKICAgIHJhaXNlIFN5c3RlbUV4aXQoMCkKcyA9IHMucmVwbGFjZShvbGRfY2FsbCwgbmV3X2NhbGwsIDEpCgpvcGVuKHAsICJ3Iikud3JpdGUocykKcHJpbnQoInN1X21vdW50X25zLmM6IHBhdGhfbW91bnQgLT4gZG9fbW91bnQiKQo=').decode()
+sys.argv = ['smn_fix', sys.argv[1]]
+exec(compile(src, '<smn_fix>', 'exec'))
+SMNEOF
+fi
+KUM="$SUDIR/feature/kernel_umount.c"
+if [ -f "$KUM" ] && grep -q 'path_umount' "$KUM"; then
+python3 - "$KUM" <<'KUMEOF'
+import sys, base64
+src = base64.b64decode('aW1wb3J0IHN5cwoKcCA9IHN5cy5hcmd2WzFdCnMgPSBvcGVuKHApLnJlYWQoKQoKb2xkID0gImV4dGVybiBpbnQgcGF0aF91bW91bnQoc3RydWN0IHBhdGggKnBhdGgsIGludCBmbGFncyk7IgpuZXcgPSAoIi8qIDUuNCBoYXMgbm8gcGF0aF91bW91bnQoKTsga3N5c191bW91bnQoKSB0YWtlcyBhIHBhdGggc3RyaW5nLiAqL1xuIgogICAgICAgImV4dGVybiBpbnQga3N5c191bW91bnQoY2hhciBfX3VzZXIgKm5hbWUsIGludCBmbGFncyk7IikKaWYgb2xkIG5vdCBpbiBzOgogICAgcHJpbnQoInBhdGhfdW1vdW50IGRlY2wgYW5jaG9yIG5vdCBmb3VuZCwgc2tpcHBlZCIpCiAgICByYWlzZSBTeXN0ZW1FeGl0KDApCnMgPSBzLnJlcGxhY2Uob2xkLCBuZXcsIDEpCgpvbGRfZm4gPSAic3RhdGljIHZvaWQga3N1X3Vtb3VudF9tbnQoY29uc3QgY2hhciAqbW50LCBzdHJ1Y3QgcGF0aCAqcGF0aCwgaW50IGZsYWdzKVxue1xuICAgIGludCBlcnIgPSBwYXRoX3Vtb3VudChwYXRoLCBmbGFncyk7XG4iCm5ld19mbiA9ICgic3RhdGljIHZvaWQga3N1X3Vtb3VudF9tbnQoY29uc3QgY2hhciAqbW50LCBzdHJ1Y3QgcGF0aCAqcGF0aCwgaW50IGZsYWdzKVxuIgogICAgICAgICAgIntcbiIKICAgICAgICAgICIgICAgaW50IGVycjtcbiIKICAgICAgICAgICIgICAgY2hhciAqZGlyID0ga21hbGxvYyhQQVRIX01BWCwgR0ZQX0tFUk5FTCk7XG4iCiAgICAgICAgICAiXG4iCiAgICAgICAgICAiICAgIGlmICghZGlyKVxuIgogICAgICAgICAgIiAgICAgICAgcmV0dXJuO1xuIgogICAgICAgICAgIiAgICB7XG4iCiAgICAgICAgICAiICAgICAgICBjaGFyICpwMiA9IGRfcGF0aChwYXRoLCBkaXIsIFBBVEhfTUFYKTtcbiIKICAgICAgICAgICIgICAgICAgIGlmICghSVNfRVJSKHAyKSkge1xuIgogICAgICAgICAgIiAgICAgICAgICAgIG1tX3NlZ21lbnRfdCBvbGRmcyA9IGdldF9mcygpO1xuIgogICAgICAgICAgIiAgICAgICAgICAgIHNldF9mcyhLRVJORUxfRFMpO1xuIgogICAgICAgICAgIiAgICAgICAgICAgIGVyciA9IGtzeXNfdW1vdW50KChjaGFyIF9fdXNlciAqKXAyLCBmbGFncyk7XG4iCiAgICAgICAgICAiICAgICAgICAgICAgc2V0X2ZzKG9sZGZzKTtcbiIKICAgICAgICAgICIgICAgICAgIH0gZWxzZSB7XG4iCiAgICAgICAgICAiICAgICAgICAgICAgZXJyID0gKGludClQVFJfRVJSKHAyKTtcbiIKICAgICAgICAgICIgICAgICAgIH1cbiIKICAgICAgICAgICIgICAgfVxuIgogICAgICAgICAgIiAgICBrZnJlZShkaXIpO1xuIikKaWYgb2xkX2ZuIG5vdCBpbiBzOgogICAgcHJpbnQoImtzdV91bW91bnRfbW50IGJvZHkgYW5jaG9yIG5vdCBmb3VuZCwgc2tpcHBlZCIpCiAgICByYWlzZSBTeXN0ZW1FeGl0KDApCnMgPSBzLnJlcGxhY2Uob2xkX2ZuLCBuZXdfZm4sIDEpCgpvcGVuKHAsICJ3Iikud3JpdGUocykKcHJpbnQoImtlcm5lbF91bW91bnQuYzogcGF0aF91bW91bnQgLT4ga3N5c191bW91bnQiKQo=').decode()
+sys.argv = ['kum_fix', sys.argv[1]]
+exec(compile(src, '<kum_fix>', 'exec'))
+KUMEOF
+fi
+echo "=== [SUSFS] step 8: satisfy ksu_handle_devpts referenced by fs/devpts/inode.c ==="
+# The vendor tree already carries the KernelSU/ReSukiSU devpts hook:
+#   #ifdef CONFIG_KSU
+#   extern int ksu_handle_devpts(struct inode *);
+#   ksu_handle_devpts(dentry->d_inode);
+#   #endif
+# FinaSU documents this hook but ships no implementation, so the link step
+# dies with "undefined symbol: ksu_handle_devpts". FinaSU's own docs mark the
+# function as dead code on modern trees, so provide the no-op definition here
+# instead of ripping the call out of fs/devpts/inode.c.
+SCT="$SUDIR/feature/sucompat.c"
+if [ -f "$SCT" ] && ! grep -q ksu_handle_devpts "$SCT"; then
+python3 - "$SCT" <<'DEVPEOF'
+import sys
+p = sys.argv[1]
+s = open(p, encoding='utf-8').read()
+add = (
+    chr(10) +
+    '/* ksu54_devpts_stub: the vendor fs/devpts/inode.c still calls this hook' + chr(10) +
+    ' * (carried over from the ReSukiSU era patch). FinaSU has no' + chr(10) +
+    ' * implementation and treats it as dead code, so define a no-op that the' + chr(10) +
+    ' * linker can satisfy. ' + chr(10) +
+    ' */' + chr(10) +
+    'int __maybe_unused ksu_handle_devpts(struct inode *inode)' + chr(10) +
+    '{' + chr(10) +
+    '    (void)inode;' + chr(10) +
+    '    return 0;' + chr(10) +
+    '}' + chr(10)
+)
+s = s + add
+open(p, 'w', encoding='utf-8').write(s)
+print('sucompat.c: ksu_handle_devpts no-op stub appended')
+DEVPEOF
+fi
+echo "=== [SUSFS] step 8b: guard fs/devpts/inode.c hook call behind the stub ==="
+DPT="$KDIR/fs/devpts/inode.c"
+if [ -f "$DPT" ] && grep -q ksu_handle_devpts "$DPT"; then
+  echo "fs/devpts/inode.c keeps ksu_handle_devpts call, stub provides the symbol"
+fi
+
+
+echo "=== [SUSFS] verification ==="
+grep -n 'susfs_set_current_proc_no_su\|for_zygote_next' include/linux/susfs_def.h
+grep -n '(void)zygote_next' "$SH" || true
+ls -l include/linux/ksu54_compat.h
+grep -rn ksu54_compat "$SUDIR" | head -10
+echo "=== [SUSFS] DONE ==="

@@ -1,0 +1,42 @@
+diff --git a/kernel/sched/walt/cpu-boost.c b/kernel/sched/walt/cpu-boost.c
+index 9b2363cf2..522a1fa08 100644
+--- a/kernel/sched/walt/cpu-boost.c
++++ b/kernel/sched/walt/cpu-boost.c
+@@ -51,6 +51,17 @@ static struct work_struct input_boost_work;
+ 
+ static bool input_boost_enabled;
+ 
++/*
++ * Power refactor: master switch, default 0 = input boost inert.
++ * vendor perfd may still write input_boost_freq at boot; with the master
++ * off those writes have no effect. Opt in at runtime:
++ *   echo 1 > /sys/devices/system/cpu/cpu_boost/input_boost
++ */
++static unsigned int input_boost_master;
++show_one(input_boost_master);
++store_one(input_boost_master);
++cpu_boost_attr_rw(input_boost_master);
++
+ static unsigned int input_boost_ms = 40;
+ show_one(input_boost_ms);
+ store_one(input_boost_ms);
+@@ -244,7 +255,7 @@ static void cpuboost_input_event(struct input_handle *handle,
+ {
+ 	u64 now;
+ 
+-	if (!input_boost_enabled)
++	if (!input_boost_enabled || !input_boost_master)
+ 		return;
+ 
+ 	now = ktime_to_us(ktime_get());
+@@ -374,6 +385,10 @@ int cpu_boost_init(void)
+ 	if (ret)
+ 		pr_err("Failed to create input_boost_ms node: %d\n", ret);
+ 
++	ret = sysfs_create_file(cpu_boost_kobj, &input_boost_master_attr.attr);
++	if (ret)
++		pr_err("Failed to create input_boost node: %d\n", ret);
++
+ 	ret = sysfs_create_file(cpu_boost_kobj, &input_boost_freq_attr.attr);
+ 	if (ret)
+ 		pr_err("Failed to create input_boost_freq node: %d\n", ret);

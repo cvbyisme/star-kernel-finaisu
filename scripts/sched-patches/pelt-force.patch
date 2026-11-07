@@ -1,0 +1,54 @@
+diff --git a/kernel/sched/cpufreq_schedutil.c b/kernel/sched/cpufreq_schedutil.c
+index 826d640e6..e00e6cb01 100644
+--- a/kernel/sched/cpufreq_schedutil.c
++++ b/kernel/sched/cpufreq_schedutil.c
+@@ -177,10 +177,19 @@ static bool sugov_up_down_rate_limit(struct sugov_policy *sg_policy, u64 time,
+ 	return false;
+ }
+ 
++/*
++ * Star power tuning: force the PELT util path even on WALT builds.
++ * The WALT util signal path hangs the device at the Xiaomi logo when
++ * schedutil is the built-in default governor (verified on star).
++ * The WALT scheduler itself stays enabled for placement/boost; only
++ * schedutil's util source is switched to PELT.
++ */
++static int sugov_force_pelt = 1;
++
+ static inline bool use_pelt(void)
+ {
+ #ifdef CONFIG_SCHED_WALT
+-	return false;
++	return sugov_force_pelt != 0;
+ #else
+ 	return true;
+ #endif
+@@ -485,6 +494,8 @@ static unsigned int get_next_freq(struct sugov_policy *sg_policy,
+ 	trace_android_vh_map_util_freq(util, freq, max, &next_freq);
+ 	if (next_freq)
+ 		raw_freq = next_freq;
++	else if (use_pelt())
++		raw_freq = map_util_freq(util, freq, max);
+ 	else
+ 		raw_freq = walt_map_util_freq(util, sg_policy, max, sg_cpu->cpu);
+ 
+@@ -622,14 +633,15 @@ static unsigned long sugov_get_util(struct sugov_cpu *sg_cpu)
+ 	sg_cpu->bw_dl = cpu_bw_dl(rq);
+ 
+ #ifdef CONFIG_SCHED_WALT
+-	util = cpu_util_freq_walt(sg_cpu->cpu, &sg_cpu->walt_load);
++	if (!use_pelt()) {
++		util = cpu_util_freq_walt(sg_cpu->cpu, &sg_cpu->walt_load);
+ 
+-	return uclamp_rq_util_with(rq, util, NULL);
+-#else
++		return uclamp_rq_util_with(rq, util, NULL);
++	}
++#endif
+ 	util = cpu_util_cfs(rq);
+ 
+ 	return schedutil_cpu_util(sg_cpu->cpu, util, max, FREQUENCY_UTIL, NULL);
+-#endif
+ }
+ 
+ /**
