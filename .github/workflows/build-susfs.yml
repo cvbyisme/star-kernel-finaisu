@@ -31,6 +31,14 @@ on:
         default: false
         type: boolean
 
+      kernel_release:
+        description: '覆盖内核 release（如 5.4.210-qgki-g71d7658432ee），留空=默认 5.4.302-Neko-CL-<日期>-<随机>'
+        required: false
+        default: ''
+      build_timestamp:
+        description: '覆盖编译时间，原样写入 /proc/version（如 Thu Sep 14 02:07:15 UTC 2023），留空=当前时间'
+        required: false
+        default: ''
 jobs:
   build:
     runs-on: ubuntu-latest
@@ -214,6 +222,34 @@ jobs:
           NEKO_VER="Neko-CL-$(date +%Y%m%d)-$(od -An -N2 -tu2 /dev/urandom | tr -d ' ')"
           echo "NEKO_VER=$NEKO_VER" >> $GITHUB_ENV
           echo "kernel localversion: -$NEKO_VER"
+          # ---- 可选：定制内核 release / 编译时间（伪装或对齐某个原厂串）----
+          KREL="${{ inputs.kernel_release }}"
+          if [ -n "$KREL" ]; then
+            KBASE="${KREL%%-*}"          # 5.4.210
+            KV="${KBASE%%.*}"
+            KREST="${KBASE#*.}"
+            KP="${KREST%%.*}"
+            KS="${KREST#*.}"
+            if [ "$KREL" = "$KBASE" ]; then KLOCAL=""; else KLOCAL="-${KREL#*-}"; fi
+            PKG_SUFFIX="-cust"
+            echo "custom release: VERSION=$KV PATCHLEVEL=$KP SUBLEVEL=$KS LOCALVERSION=$KLOCAL"
+          else
+            KV=""; KP=""; KS=""; KLOCAL="-$NEKO_VER"; PKG_SUFFIX=""
+          fi
+          echo "KV=$KV" >> $GITHUB_ENV
+          echo "KP=$KP" >> $GITHUB_ENV
+          echo "KS=$KS" >> $GITHUB_ENV
+          echo "KLOCAL=$KLOCAL" >> $GITHUB_ENV
+          echo "PKG_SUFFIX=$PKG_SUFFIX" >> $GITHUB_ENV
+          # 编译时间：内核 scripts/mkcompile_h 会把它原样写进 UTS_VERSION
+          KTS="${{ inputs.build_timestamp }}"
+          if [ -n "$KTS" ]; then
+            export KBUILD_BUILD_TIMESTAMP="$KTS"
+            export KBUILD_BUILD_VERSION=1
+            echo "KBUILD_BUILD_TIMESTAMP=$KTS" >> $GITHUB_ENV
+            echo "KBUILD_BUILD_VERSION=1" >> $GITHUB_ENV
+            echo "custom build timestamp: $KTS"
+          fi
 
           make -j$(nproc) O=out star_defconfig
 
@@ -287,7 +323,8 @@ jobs:
 
           # D1 修补：不传 KSU_SECOND_SIGNATURE_RELEASE=1 时，
           # FINASU_TRUSTED_* 回落到 slot1（KSU 官方签名），slot2 白注入。
-          make -j$(nproc) O=out LOCALVERSION="-$NEKO_VER" \
+          make -j$(nproc) O=out LOCALVERSION="$KLOCAL" \
+            ${KV:+VERSION=$KV} ${KP:+PATCHLEVEL=$KP} ${KS:+SUBLEVEL=$KS} \
             KSU_SECOND_SIGNATURE_RELEASE=1 \
             KSU_EXPECTED_SIZE2=716 \
             KSU_EXPECTED_HASH2=2d89b50aaf1db013c2b6738f973f48b62ea21a3a8d7216bfec3521065d448458 \
@@ -300,6 +337,7 @@ jobs:
           cp kernel/out/arch/arm64/boot/Image.gz artifact/Image.gz || true
           cp kernel/out/.config artifact/kernel.config
           (cd artifact && sha256sum Image > Image.sha256)
+          grep -h 'define UTS_VERSION\|define UTS_RELEASE\|define LINUX_COMPILE_BY' kernel/out/include/generated/compile.h kernel/out/include/generated/utsrelease.h 2>/dev/null || true
           strings artifact/Image | grep -m3 'Linux version' || true
 
       - name: Upload artifact
@@ -371,7 +409,7 @@ jobs:
           sed -i "s/^IS_SLOT_DEVICE=.*/IS_SLOT_DEVICE=1;/" anykernel.sh
           sed -i '/^backup_file /d;/^replace_string /d;/^insert_line /d;/^append_file /d;/^patch_fstab /d' anykernel.sh
           chmod +x anykernel.sh
-          NAME="star-FinaSU-$(date +%Y%m%d)-run${GITHUB_RUN_NUMBER}"
+          NAME="star-FinaSU-$(date +%Y%m%d)-run${GITHUB_RUN_NUMBER}${PKG_SUFFIX}"
           zip -r9 "../${NAME}.zip" . -x "*.git*" > /dev/null
           cd ..
           ls -lh *.zip
@@ -387,7 +425,7 @@ jobs:
 
             NOT VERIFIED ON DEVICE. Flash at your own risk.
 
-            - Kernel 5.4.302-${{ env.NEKO_VER }}, ZyC clang 14.0.6
+            - Kernel ${{ env.KV || '5' }}.${{ env.KP || '4' }}.${{ env.KS || '302' }}${{ env.KLOCAL }}, ZyC clang 14.0.6
             - KSU_SECOND_SIGNATURE_RELEASE=1 (slot2 = FinaSU release key, size 716)
             - preflight v2: 5.4 shim headers + global -include + devpts/umount retarget
             - Package: AnyKernel3 zip

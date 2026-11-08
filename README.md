@@ -193,6 +193,27 @@ FinaSU 的 ksud 要求内核 SUSFS 版本字符串**精确等于 `v2.3.0`**，�
 
 > CI 里 `actions/checkout` 用 `path: ci`，所以脚本的真实路径是 `ci/scripts/*`（= 仓库 `scripts/*`）。
 
+### 定制内核 release / 编译时间
+dispatch 时可选传两个输入，用来把内核指纹做成指定的样子（默认留空 = 5.4.302-Neko-CL-<日期>-<随机> + 当前时间）：
+
+| 输入 | 作用 |
+|---|---|
+| `kernel_release` | 覆盖版本串，如 `5.4.210-qgki-g71d7658432ee` → `VERSION=5 PATCHLEVEL=4 SUBLEVEL=210`、`LOCALVERSION=-qgki-g71d7658432ee` |
+| `build_timestamp` | 原样写入 `UTS_VERSION`，即 `/proc/version` 里的编译时间 |
+
+示例（两个都填）：
+```
+kernel_release : 5.4.210-qgki-g71d7658432ee
+build_timestamp: Thu Sep 14 02:07:15 UTC 2023
+```
+编译出来的 `/proc/version` 会像：
+```
+Linux version 5.4.210-qgki-g71d7658432ee (runner@fv-az...) (clang version ...) #1 SMP PREEMPT Thu Sep 14 02:07:15 UTC 2023
+```
+此时产物名会多一个 `-cust` 后缀（`star-FinaSU-<日期>-run<n>-cust.zip`），action 日志里也会打印 `custom release:` / `custom build timestamp:` 以及 `compile.h` 里的 `UTS_VERSION`，便于核对。
+
+> 注意：`KBUILD_BUILD_TIMESTAMP` 是内核 `scripts/mkcompile_h` 的官方钩子，按字面写入、不做时区换算，所以想显示什么格式就传什么格式。`KBUILD_BUILD_USER` / `KBUILD_BUILD_HOST` 暂未开放成输入，需要时再说。
+
 ### 构建门禁
 `ksu_handle_*`、`CONFIG_KSU`、`CONFIG_KSU_SUSFS_*`、`CONFIG_KPROBES` 这些符号**静默缺失**（`scripts/config` 不校验依赖，`olddefconfig` 阶段被丢弃且不报错）是踩过最深的坑之一。现在 workflow 有两道门禁：
 1. **Fast compile gate**：只编 `drivers/kernelsu/kernelsu.o`，3–5 分钟暴露编译错误
